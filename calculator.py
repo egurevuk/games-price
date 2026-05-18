@@ -1,118 +1,653 @@
-import streamlit as st
+"""
+BIK Sanctions Screener
+======================
+Streamlit app that takes a Russian BIK (Bank Identification Code / БИК),
+resolves the bank's official name via OpenSanctions' `ru_cbr_banks` dataset
+(sourced from the Central Bank of Russia), and screens it against global
+sanctions lists via the OpenSanctions /match API.
+
+Author: built for Stape Online Ltd
+"""
+
+from __future__ import annotations
+
+import os
+import re
+import json
+import time
+from datetime import datetime
+from typing import Any
+
 import pandas as pd
 import requests
-from datetime import datetime
+import streamlit as st
 
-st.set_page_config(page_title="Steam Regional Price Calculator", layout="wide")
-st.title("Steam Regional Price Recommendation Tool")
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
 
-# Currency data with exchange rates and PPP factors (based on 2025-2026 data)
-currency_data = {
-    'USD': {'country': 'United States', 'exchange_rate': 1.0, 'ppp_factor': 1.0, 'region': 'Americas'},
-    'EUR': {'country': 'Europe', 'exchange_rate': 0.92, 'ppp_factor': 0.95, 'region': 'Europe'},
-    'GBP': {'country': 'United Kingdom', 'exchange_rate': 0.79, 'ppp_factor': 0.92, 'region': 'Europe'},
-    'CAD': {'country': 'Canada', 'exchange_rate': 1.37, 'ppp_factor': 1.05, 'region': 'Americas'},
-    'AUD': {'country': 'Australia', 'exchange_rate': 1.55, 'ppp_factor': 1.08, 'region': 'APAC'},
-    'JPY': {'country': 'Japan', 'exchange_rate': 147.50, 'ppp_factor': 0.75, 'region': 'APAC'},
-    'CNY': {'country': 'China', 'exchange_rate': 7.25, 'ppp_factor': 0.45, 'region': 'APAC'},
-    'INR': {'country': 'India', 'exchange_rate': 84.20, 'ppp_factor': 0.25, 'region': 'APAC'},
-    'BRL': {'country': 'Brazil', 'exchange_rate': 5.25, 'ppp_factor': 0.40, 'region': 'Americas'},
-    'MXN': {'country': 'Mexico', 'exchange_rate': 20.50, 'ppp_factor': 0.35, 'region': 'Americas'},
-    'RUB': {'country': 'Russia', 'exchange_rate': 105.00, 'ppp_factor': 0.30, 'region': 'CIS'}, 
-    'TRY': {'country': 'Turkey', 'exchange_rate': 35.50, 'ppp_factor': 0.22, 'region': 'MENA'},
-    'ZAR': {'country': 'South Africa', 'exchange_rate': 18.50, 'ppp_factor': 0.18, 'region': 'Africa'},
-    'ARS': {'country': 'Argentina', 'exchange_rate': 1050.00, 'ppp_factor': 0.15, 'region': 'Americas'},
+OS_BASE = "https://api.opensanctions.org"
+BANKS_DATASET = "ru_cbr_banks"          # CBR-sourced Russian banking registry
+SANCTIONS_SCOPE = "sanctions"           # /match endpoint scope (sanctions only)
+DEFAULT_SCOPE = "default"               # /match endpoint scope (everything)
+ALGORITHM = "logic-v2"                  # current recommended scoring algo
+REQUEST_TIMEOUT = 30
+SANCTION_SCORE_THRESHOLD = 0.70         # below this we don't alert
+STRONG_SCORE_THRESHOLD = 0.85           # above this we treat as confirmed
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def normalize_bik(raw: str) -> str:
+    """Strip non-digits and left-pad to 9 digits.
+
+    Russian BIKs are formally 9 digits, but operators frequently drop the
+    leading zero (e.g. `44525700` -> `044525700`).
+    """
+    digits = re.sub(r"\D", "", str(raw or ""))
+    if not digits:
+        return ""
+    if len(digits) == 8:
+        digits = "0" + digits
+    return digits
+
+
+def is_valid_bik(bik: str) -> bool:
+    return bool(re.fullmatch(r"\d{9}", bik))
+
+
+def os_headers(api_key: str | None) -> dict:
+    """Build Authorization header for OpenSanctions if a key is set."""
+    if api_key:
+        return {"Authorization": f"ApiKey {api_key}"}
+    return {}
+
+
+# ---------------------------------------------------------------------------
+# OpenSanctions API calls
+# ---------------------------------------------------------------------------
+
+@st.cache_data(show_spinner=False, ttl=3600)
+def lookup_bank_in_cbr_registry(bik: str, api_key: str) -> dict | None:
+    """Resolve a BIK to a bank entity in OpenSanctions' CBR banking registry.
+
+    Uses the /search endpoint scoped to the `ru_cbr_banks` dataset. We pass
+    the BIK as the query text — the search index covers identifiers,
+    so a precise match is returned for any valid BIK.
+    """
+    url = f"{OS_BASE}/search/{BANKS_DATASET}"
+    params = {"q": bik, "limit": 10}
+    resp = requests.get(
+        url, params=params, headers=os_headers(api_key), timeout=REQUEST_TIMEOUT
+    )
+    resp.raise_for_status()
+    data = resp.json()
+    results = data.get("results", [])
+
+    # Prefer results where the BIK appears literally in identifiers/registrationNumber
+    for r in results:
+        props = r.get("properties", {}) or {}
+        haystack = (
+            (props.get("registrationNumber") or [])
+            + (props.get("bikCode") or [])
+            + (props.get("ogrnCode") or [])
+            + (props.get("innCode") or [])
+        )
+        haystack = [str(x) for x in haystack]
+        if any(bik in v or v in bik for v in haystack):
+            return r
+
+    # Fallback: highest-ranked result if anything was returned
+    return results[0] if results else None
+
+
+@st.cache_data(show_spinner=False, ttl=3600)
+def fetch_full_entity(entity_id: str, api_key: str) -> dict | None:
+    """Get a nested entity record (with sanctions relationships) by ID."""
+    url = f"{OS_BASE}/entities/{entity_id}"
+    resp = requests.get(
+        url, headers=os_headers(api_key), timeout=REQUEST_TIMEOUT
+    )
+    if resp.status_code == 404:
+        return None
+    resp.raise_for_status()
+    return resp.json()
+
+
+@st.cache_data(show_spinner=False, ttl=3600)
+def match_against_sanctions(
+    bank_entity: dict, api_key: str, scope: str = SANCTIONS_SCOPE
+) -> dict:
+    """Run OpenSanctions /match using the bank entity as query-by-example.
+
+    We pass every known identifier (BIK, INN, OGRN, etc.) plus every name
+    variant, so the scoring algorithm has maximum signal. The endpoint
+    returns up to 5 candidate matches each with a score.
+    """
+    url = f"{OS_BASE}/match/{scope}"
+    props = (bank_entity or {}).get("properties", {}) or {}
+
+    # Pick out the properties that make sense to forward
+    query_props: dict[str, list[str]] = {}
+    for key in (
+        "name", "alias", "previousName", "weakAlias",
+        "innCode", "ogrnCode", "registrationNumber",
+        "taxNumber", "swiftBic", "bikCode",
+        "address", "mainCountry", "jurisdiction",
+        "website", "email", "phone",
+    ):
+        vals = props.get(key)
+        if vals:
+            query_props[key] = [str(v) for v in vals]
+
+    # Always force jurisdiction=Russia if not present (helps disambiguate)
+    query_props.setdefault("jurisdiction", ["Russia"])
+
+    payload = {"queries": {"q1": {"schema": "Company", "properties": query_props}}}
+    params = {"algorithm": ALGORITHM}
+
+    resp = requests.post(
+        url,
+        params=params,
+        headers={**os_headers(api_key), "Content-Type": "application/json"},
+        data=json.dumps(payload),
+        timeout=REQUEST_TIMEOUT,
+    )
+    resp.raise_for_status()
+    return resp.json()
+
+
+# ---------------------------------------------------------------------------
+# Verdict logic
+# ---------------------------------------------------------------------------
+
+def is_sanctioned_topic(topics: list[str] | None) -> bool:
+    """Topics list contains 'sanction' if the entity is on a sanctions list.
+
+    OpenSanctions topics include things like: sanction, sanction.linked,
+    sanction.counter, role.pep, crime, debarment, export.control. We treat
+    a direct `sanction` tag as the strong signal. `sanction.linked` (an
+    entity linked to but not itself sanctioned) is flagged for review.
+    """
+    if not topics:
+        return False
+    t = [str(x).lower() for x in topics]
+    return "sanction" in t
+
+
+# Datasets that are clear sanctions sources — used as a fallback signal
+# when topics aren't populated on a /search response.
+SANCTIONS_DATASETS_HINTS = {
+    "sanctions", "default",
+    "us_ofac_sdn", "us_ofac_cons",
+    "eu_fsf", "eu_sanctions_map", "eu_travel_bans",
+    "gb_hmt_sanctions", "gb_fcdo_sanctions",
+    "ca_dfatd_sema_sanctions",
+    "ch_seco_sanctions",
+    "au_dfat_sanctions",
+    "ja_mof_sanctions",
+    "nz_russia_sanctions",
+    "ua_nsdc_sanctions", "ua_war_sanctions",
+    "fr_ga_sanctions", "be_fod_sanctions",
+    "sg_terrorists",
+    "mc_freezes",
 }
 
-# Sidebar inputs
-st.sidebar.header("Settings")
-base_price_usd = st.sidebar.number_input("Base Price (USD)", value=10.0, min_value=0.99, step=0.01)
-pricing_method = st.sidebar.selectbox(
-    "Pricing Method",
-    ["Exchange Rate Only", "Purchasing Power (PPP)", "Multi-Variable (Recommended)"]
+
+def classify(bank_entity: dict, match_response: dict) -> dict:
+    """Combine entity-level evidence and /match evidence into a verdict.
+
+    Returns dict with:
+        status:    "sanctioned" | "clear" | "review"
+        reasons:   list[str] human-readable evidence
+        top_hits:  list[dict] sanctions candidates with scores
+    """
+    reasons: list[str] = []
+    top_hits: list[dict] = []
+    status = "clear"
+
+    bank_entity = bank_entity or {}
+    props = bank_entity.get("properties", {}) or {}
+
+    # 1) The bank registry entity is itself marked as a sanctions target.
+    #    OpenSanctions sets `target=True` on entities that are designated
+    #    on any watchlist. Because the CBR registry is deduplicated against
+    #    sanctions lists, this is the most reliable signal.
+    if bank_entity.get("target") is True:
+        status = "sanctioned"
+        reasons.append("Bank entity is flagged as a sanctions `target` in OpenSanctions.")
+
+    # 2) Topic-based check (belt-and-braces; covers entities where the
+    #    search response includes topics but not target=True).
+    topics = props.get("topics") or bank_entity.get("topics") or []
+    if is_sanctioned_topic(topics) and status != "sanctioned":
+        status = "sanctioned"
+        reasons.append(f"Bank entity carries sanctions topic ({', '.join(topics)}).")
+
+    # 3) Dataset-membership check — if the entity belongs to any dataset
+    #    other than `ru_cbr_banks` AND that dataset looks sanctions-related,
+    #    flag as sanctioned. (Pure debarment/PEP datasets won't trigger.)
+    datasets = bank_entity.get("datasets") or []
+    other_ds = [d for d in datasets if d != BANKS_DATASET]
+    sanction_ds_hits = [d for d in other_ds if d in SANCTIONS_DATASETS_HINTS
+                        or "sanction" in d.lower() or "ofac" in d.lower()]
+    if sanction_ds_hits and status != "sanctioned":
+        status = "sanctioned"
+        reasons.append(f"Bank appears in sanctions dataset(s): {', '.join(sanction_ds_hits)}.")
+
+    # 4) Independent verification via /match
+    q1 = (match_response or {}).get("responses", {}).get("q1", {})
+    for hit in q1.get("results", []) or []:
+        score = float(hit.get("score") or 0)
+        hit_topics = (hit.get("properties", {}) or {}).get("topics") or \
+                     hit.get("topics") or []
+        top_hits.append({
+            "id": hit.get("id"),
+            "caption": hit.get("caption"),
+            "score": score,
+            "match": bool(hit.get("match")),
+            "target": bool(hit.get("target")),
+            "topics": hit_topics,
+            "datasets": hit.get("datasets", []),
+            "schema": hit.get("schema"),
+        })
+        if hit.get("match") and (is_sanctioned_topic(hit_topics) or hit.get("target")):
+            if status != "sanctioned":
+                status = "sanctioned"
+            reasons.append(
+                f"/match returned a confirmed match: "
+                f"\"{hit.get('caption')}\" score={score:.2f}"
+                + (f" topics=[{', '.join(hit_topics)}]" if hit_topics else "")
+            )
+
+    # 5) High-score but unconfirmed → REVIEW
+    if status == "clear" and top_hits:
+        best = max(top_hits, key=lambda x: x["score"])
+        if best["score"] >= SANCTION_SCORE_THRESHOLD:
+            status = "review"
+            reasons.append(
+                f"Top candidate \"{best['caption']}\" scored {best['score']:.2f} "
+                f"(≥ {SANCTION_SCORE_THRESHOLD:.2f} threshold). Manual review recommended."
+            )
+
+    if status == "clear" and not reasons:
+        reasons.append("No matches above the alert threshold across sanctions lists.")
+
+    return {"status": status, "reasons": reasons, "top_hits": top_hits}
+
+
+# ---------------------------------------------------------------------------
+# UI helpers
+# ---------------------------------------------------------------------------
+
+def render_status_badge(status: str) -> None:
+    colors = {
+        "sanctioned": ("#b00020", "❌  SANCTIONED"),
+        "review":     ("#b07a00", "⚠️  REVIEW REQUIRED"),
+        "clear":      ("#0a7a2f", "✅  CLEAR"),
+        "error":      ("#444444", "⚠  LOOKUP ERROR"),
+        "unknown":    ("#444444", "❔ UNKNOWN BIK"),
+    }
+    color, label = colors.get(status, ("#444444", status.upper()))
+    st.markdown(
+        f"<div style='display:inline-block;padding:6px 14px;"
+        f"background:{color};color:white;border-radius:6px;"
+        f"font-weight:600;font-size:0.95rem'>{label}</div>",
+        unsafe_allow_html=True,
+    )
+
+
+def first(props: dict, key: str, default: str = "—") -> str:
+    vals = props.get(key) or []
+    return str(vals[0]) if vals else default
+
+
+def render_bank_card(bank: dict) -> None:
+    props = bank.get("properties", {}) or {}
+    name = first(props, "name", "(no name)")
+    inn = first(props, "innCode")
+    ogrn = first(props, "ogrnCode")
+    address = first(props, "address")
+    status = first(props, "status")
+    incorp = first(props, "incorporationDate")
+    aliases = props.get("alias") or []
+
+    st.markdown(f"### {name}")
+    cols = st.columns([1, 1, 1])
+    cols[0].metric("INN", inn)
+    cols[1].metric("OGRN", ogrn)
+    cols[2].metric("Status", status)
+
+    with st.expander("More bank details", expanded=False):
+        if address != "—":
+            st.write(f"**Address:** {address}")
+        if incorp != "—":
+            st.write(f"**Incorporated:** {incorp}")
+        if aliases:
+            st.write("**Aliases:** " + " · ".join(aliases[:10]))
+        st.write(f"**OpenSanctions entity:** [`{bank.get('id')}`](https://www.opensanctions.org/entities/{bank.get('id')}/)")
+
+
+def render_match_table(top_hits: list[dict]) -> None:
+    if not top_hits:
+        st.info("No candidate matches returned by /match.")
+        return
+    rows = []
+    for h in top_hits:
+        rows.append({
+            "Score": round(h["score"], 3),
+            "Confirmed match": "✅" if h["match"] else "—",
+            "Entity": h["caption"],
+            "Topics": ", ".join(h["topics"] or []),
+            "Datasets": ", ".join(h["datasets"] or []),
+            "OpenSanctions link": f"https://www.opensanctions.org/entities/{h['id']}/",
+        })
+    df = pd.DataFrame(rows).sort_values("Score", ascending=False)
+    st.dataframe(
+        df,
+        use_container_width=True,
+        hide_index=True,
+        column_config={
+            "OpenSanctions link": st.column_config.LinkColumn(
+                "OpenSanctions link", display_text="open ↗"
+            ),
+        },
+    )
+
+
+# ---------------------------------------------------------------------------
+# Per-BIK pipeline
+# ---------------------------------------------------------------------------
+
+def screen_bik(bik_raw: str, api_key: str, scope: str) -> dict:
+    """Run the full pipeline for a single BIK and return a result dict."""
+    bik = normalize_bik(bik_raw)
+    result: dict[str, Any] = {
+        "bik_input": bik_raw,
+        "bik": bik,
+        "status": "error",
+        "bank": None,
+        "match": None,
+        "verdict": None,
+        "error": None,
+    }
+    if not is_valid_bik(bik):
+        result["status"] = "error"
+        result["error"] = "BIK must be 8 or 9 digits."
+        return result
+
+    try:
+        bank = lookup_bank_in_cbr_registry(bik, api_key)
+    except requests.HTTPError as exc:
+        result["error"] = f"CBR lookup failed: {exc.response.status_code} {exc.response.text[:200]}"
+        return result
+    except Exception as exc:
+        result["error"] = f"CBR lookup failed: {exc}"
+        return result
+
+    if not bank:
+        result["status"] = "unknown"
+        result["error"] = "No bank found in CBR registry for this BIK."
+        return result
+    result["bank"] = bank
+
+    # Pull the fully-hydrated entity (includes datasets + sanction relationships)
+    full = None
+    if bank.get("id"):
+        try:
+            full = fetch_full_entity(bank["id"], api_key)
+        except Exception:
+            pass
+    result["bank_full"] = full or bank
+
+    try:
+        match_response = match_against_sanctions(bank, api_key, scope=scope)
+    except requests.HTTPError as exc:
+        result["error"] = f"/match failed: {exc.response.status_code} {exc.response.text[:200]}"
+        return result
+    except Exception as exc:
+        result["error"] = f"/match failed: {exc}"
+        return result
+    result["match"] = match_response
+
+    verdict = classify(result["bank_full"], match_response)
+    result["verdict"] = verdict
+    result["status"] = verdict["status"]
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Streamlit UI
+# ---------------------------------------------------------------------------
+
+st.set_page_config(
+    page_title="BIK Sanctions Screener",
+    page_icon="🏦",
+    layout="wide",
 )
 
-# Calculate prices based on selected method
-def calculate_prices(base_price, method, data):
-    results = []
-    
-    for currency, info in data.items():
-        country = info['country']
-        exchange_rate = info['exchange_rate']
-        ppp_factor = info['ppp_factor']
-        region = info['region']
-        
-        if method == "Exchange Rate Only":
-            price = base_price * exchange_rate
-        elif method == "Purchasing Power (PPP)":
-            # PPP method: adjust based on purchasing power
-            price = base_price * exchange_rate * ppp_factor
-        else:  # Multi-Variable
-            # Blend of exchange rate and PPP, adjusted for regional factors
-            ppp_adjusted = base_price * exchange_rate * ppp_factor
-            exchange_only = base_price * exchange_rate
-            # 60% PPP + 40% exchange rate creates a balanced approach
-            price = (ppp_adjusted * 0.6) + (exchange_only * 0.4)
-        
-        results.append({
-            'Currency': currency,
-            'Country': country,
-            'Region': region,
-            'Local Price': round(price, 2),
-            'Exchange Rate': exchange_rate,
-            'PPP Factor': ppp_factor
-        })
-    
-    return pd.DataFrame(results)
+st.title("🏦 BIK Sanctions Screener")
+st.caption(
+    "Resolve a Russian Bank Identification Code (БИК) to its issuer and screen "
+    "it against global sanctions lists via the OpenSanctions API."
+)
 
-# Generate pricing table
-df = calculate_prices(base_price_usd, pricing_method, currency_data)
-df = df.sort_values('Region')
+# --- Sidebar config -------------------------------------------------------
+with st.sidebar:
+    st.header("Configuration")
+    api_key = st.text_input(
+        "OpenSanctions API key",
+        value=os.environ.get("OPENSANCTIONS_API_KEY", ""),
+        type="password",
+        help="Get a free key at https://www.opensanctions.org/account/",
+    )
+    scope = st.radio(
+        "Screening scope",
+        options=[SANCTIONS_SCOPE, DEFAULT_SCOPE],
+        index=0,
+        help=(
+            "`sanctions` — only checks against sanctions lists (recommended). "
+            "`default` — broader scope incl. PEPs, crime, debarment."
+        ),
+        format_func=lambda s: {
+            SANCTIONS_SCOPE: "Sanctions only (recommended)",
+            DEFAULT_SCOPE: "All (sanctions + PEPs + crime)",
+        }[s],
+    )
+    st.divider()
+    st.markdown(
+        "**About**\n\n"
+        "* BIK resolved via OpenSanctions `ru_cbr_banks` dataset "
+        "(Central Bank of Russia registry, refreshed daily).\n"
+        "* Sanctions match via `/match` endpoint with `logic-v2` scoring.\n"
+        "* The CBR dataset and many sanctions lists are deduplicated by "
+        "OpenSanctions, so a sanctioned bank shows up as a single entity "
+        "tagged with the `sanction` topic."
+    )
 
-# Display current settings
-col1, col2, col3 = st.columns(3)
-with col1:
-    st.metric("Base USD Price", f"${base_price_usd:.2f}")
-with col2:
-    st.metric("Pricing Method", pricing_method.split("(")[0].strip())
-with col3:
-    st.metric("Currencies Covered", len(currency_data))
+# --- Main pane ------------------------------------------------------------
+tab_single, tab_batch = st.tabs(["Single BIK", "Batch screening"])
+
+# ---------- Tab 1: Single BIK --------------------------------------------
+with tab_single:
+    col_in, col_btn = st.columns([3, 1])
+    with col_in:
+        bik_input = st.text_input(
+            "Enter a BIK (8 or 9 digits)",
+            placeholder="e.g. 044525700",
+            label_visibility="collapsed",
+        )
+    with col_btn:
+        run = st.button("Screen", type="primary", use_container_width=True)
+
+    # Sample chips for convenience
+    st.caption("Try a sample BIK:")
+    sample_cols = st.columns(5)
+    samples = [
+        ("040813713", "sanctioned"),
+        ("044030653", "sanctioned"),
+        ("046577904", "clear"),
+        ("046015762", "clear"),
+        ("044525700", "clear"),
+    ]
+    for col, (s, label) in zip(sample_cols, samples):
+        with col:
+            icon = "❌" if label == "sanctioned" else "✅"
+            if st.button(f"{icon} {s}", key=f"sample_{s}", use_container_width=True,
+                         help=f"expected: {label}"):
+                st.session_state["_prefill"] = s
+                st.rerun()
+
+    if "_prefill" in st.session_state and not bik_input:
+        bik_input = st.session_state.pop("_prefill")
+        run = True
+
+    if run:
+        if not api_key:
+            st.warning(
+                "Please paste an OpenSanctions API key in the sidebar. "
+                "You can get a free one at https://www.opensanctions.org/account/"
+            )
+        elif not bik_input.strip():
+            st.warning("Please enter a BIK.")
+        else:
+            with st.spinner(f"Screening BIK {normalize_bik(bik_input)}…"):
+                res = screen_bik(bik_input, api_key, scope)
+
+            st.divider()
+            top = st.columns([1, 3])
+            with top[0]:
+                render_status_badge(res["status"])
+                st.write(f"**BIK:** `{res['bik']}`")
+            with top[1]:
+                if res["status"] == "error":
+                    st.error(res["error"])
+                elif res["status"] == "unknown":
+                    st.warning(res["error"])
+                else:
+                    for r in res["verdict"]["reasons"]:
+                        st.write(f"• {r}")
+
+            if res.get("bank"):
+                st.divider()
+                render_bank_card(res["bank_full"] or res["bank"])
+
+            if res.get("verdict"):
+                st.divider()
+                st.subheader("Sanctions match candidates")
+                render_match_table(res["verdict"]["top_hits"])
+
+            with st.expander("Raw API responses (debug)"):
+                st.write("**Bank (search):**")
+                st.json(res.get("bank") or {})
+                st.write("**Bank (full entity):**")
+                st.json(res.get("bank_full") or {})
+                st.write("**/match response:**")
+                st.json(res.get("match") or {})
+
+# ---------- Tab 2: Batch screening ---------------------------------------
+with tab_batch:
+    st.write(
+        "Paste one BIK per line (or comma/space-separated). "
+        "Up to ~50 at a time is comfortable."
+    )
+    bulk = st.text_area(
+        "BIKs",
+        height=140,
+        placeholder="040813713\n044030653\n046577904\n046015762\n044525700",
+        label_visibility="collapsed",
+    )
+    run_batch = st.button("Screen all", type="primary")
+
+    if run_batch:
+        if not api_key:
+            st.warning("Please paste an OpenSanctions API key in the sidebar.")
+        else:
+            raw_biks = re.split(r"[\s,;]+", bulk.strip())
+            biks = [b for b in (normalize_bik(x) for x in raw_biks) if b]
+            biks = list(dict.fromkeys(biks))  # de-dupe, preserve order
+            if not biks:
+                st.warning("No valid BIKs found.")
+            else:
+                progress = st.progress(0.0)
+                status_line = st.empty()
+                results = []
+                for i, b in enumerate(biks, 1):
+                    status_line.write(f"Screening {b} ({i}/{len(biks)})…")
+                    results.append(screen_bik(b, api_key, scope))
+                    progress.progress(i / len(biks))
+                    # gentle rate-limit; OpenSanctions free tier ~60 rpm
+                    time.sleep(0.2)
+                status_line.empty()
+                progress.empty()
+
+                # Build a results dataframe
+                rows = []
+                for r in results:
+                    props = (r.get("bank") or {}).get("properties", {}) or {}
+                    rows.append({
+                        "BIK": r["bik"],
+                        "Status": r["status"],
+                        "Bank": first(props, "name"),
+                        "INN": first(props, "innCode"),
+                        "OGRN": first(props, "ogrnCode"),
+                        "Top hit": (
+                            r["verdict"]["top_hits"][0]["caption"]
+                            if r.get("verdict") and r["verdict"]["top_hits"] else "—"
+                        ),
+                        "Top score": (
+                            round(r["verdict"]["top_hits"][0]["score"], 3)
+                            if r.get("verdict") and r["verdict"]["top_hits"] else None
+                        ),
+                        "Notes": (
+                            r["verdict"]["reasons"][0]
+                            if r.get("verdict") and r["verdict"]["reasons"]
+                            else (r.get("error") or "")
+                        ),
+                    })
+                df = pd.DataFrame(rows)
+
+                # Color status — Styler.map (pandas ≥ 2.1; Styler.applymap is deprecated)
+                def _color(s):
+                    return {
+                        "sanctioned": "background-color:#fdecea;color:#b00020;font-weight:600",
+                        "review":     "background-color:#fff4e0;color:#b07a00;font-weight:600",
+                        "clear":      "background-color:#e9f7ee;color:#0a7a2f;font-weight:600",
+                    }.get(s, "")
+                styled = df.style.map(_color, subset=["Status"]) \
+                    if hasattr(df.style, "map") else df.style.applymap(_color, subset=["Status"])
+                st.divider()
+                st.dataframe(
+                    styled,
+                    use_container_width=True,
+                    hide_index=True,
+                )
+
+                # Export
+                csv = df.to_csv(index=False).encode("utf-8")
+                st.download_button(
+                    "Download results as CSV",
+                    csv,
+                    file_name=f"bik_screening_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}.csv",
+                    mime="text/csv",
+                )
+
+                # Per-BIK detail expanders
+                st.divider()
+                st.subheader("Details")
+                for r in results:
+                    label = f"{r['bik']} — {first((r.get('bank') or {}).get('properties', {}) or {}, 'name')} — {r['status'].upper()}"
+                    with st.expander(label):
+                        if r["status"] in ("error", "unknown"):
+                            st.error(r.get("error") or "")
+                            continue
+                        for line in r["verdict"]["reasons"]:
+                            st.write(f"• {line}")
+                        render_match_table(r["verdict"]["top_hits"])
 
 st.divider()
-
-# Show pricing table
-st.subheader("Regional Price Recommendations")
-display_df = df[['Currency', 'Country', 'Region', 'Local Price']].copy()
-display_df['Local Price'] = display_df['Local Price'].apply(lambda x: f"{x:.2f}")
-
-st.dataframe(display_df, use_container_width=True, hide_index=True)
-
-# Breakdown by region
-st.subheader("Pricing Breakdown by Region")
-region_summary = df.groupby('Region').agg({
-    'Local Price': ['min', 'max', 'mean'],
-    'Currency': 'count'
-}).round(2)
-
-region_summary.columns = ['Min Price', 'Max Price', 'Avg Price', 'Currency Count']
-st.dataframe(region_summary, use_container_width=True)
-
-# Method explanation
-st.subheader("How Each Method Works")
-method_explanations = {
-    "Exchange Rate Only": "Uses simple currency conversion at current exchange rates. Most transparent but doesn't account for local purchasing power.",
-    "Purchasing Power (PPP)": "Adjusts for local purchasing power parity. Results in lower prices for developing markets, higher accessibility.",
-    "Multi-Variable (Recommended)": "Combines exchange rates with PPP factors and regional adjustments for the most balanced approach across all markets."
-}
-
-st.info(method_explanations[pricing_method])
-
-# Export option
-st.subheader("Export")
-csv = df.to_csv(index=False)
-st.download_button(
-    label="Download pricing as CSV",
-    data=csv,
-    file_name=f"steam_pricing_{base_price_usd}usd_{datetime.now().strftime('%Y%m%d')}.csv",
-    mime="text/csv"
+st.caption(
+    f"Data: OpenSanctions ({BANKS_DATASET} + sanctions collections). "
+    "Not legal advice — confirm matches with your compliance officer."
 )
