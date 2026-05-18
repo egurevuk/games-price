@@ -1197,7 +1197,7 @@ else:
     # Overall verdict = worst (most severe) of all candidates
     severity = {"MATCH": 3, "REVIEW": 2, "LIKELY CLEAR": 1}
     candidate_verdicts.sort(key=lambda t: (severity[t[3]], t[1]), reverse=True)
-    _, top_score, top_overlap, top_label, top_emoji, top_reason = candidate_verdicts[0]
+    top_result, top_score, top_overlap, top_label, top_emoji, top_reason = candidate_verdicts[0]
 
     if top_label == "MATCH":
         st.error(f"{top_emoji} **{top_label}** — {top_reason}. Investigate before transacting.")
@@ -1205,6 +1205,52 @@ else:
         st.warning(f"{top_emoji} **{top_label}** — {top_reason}. Manual review required.")
     else:
         st.success(f"{top_emoji} **{top_label}** — {top_reason}. Likely false positive.")
+
+    # ── Top-level Sanctioning Jurisdictions ────────────────────────────────
+    # Surfaces the country breakdown from the BEST match (most severe by
+    # verdict, then highest score) directly under the verdict so the analyst
+    # doesn't need to expand candidate details to see which jurisdictions
+    # have sanctioned this entity. The same data is repeated inside the
+    # candidate expander below for completeness.
+    top_buckets = categorize_datasets(top_result.get("datasets") or [])
+    st.markdown(f"### 🌍 Sanctioning Jurisdictions")
+    st.caption(
+        f"From best match: **{top_result.get('caption', '(no caption)')}** "
+        f"(score {top_score:.3f})"
+    )
+    if top_buckets["sanctions"]:
+        st.markdown(
+            f"**{len(top_buckets['sanctions'])} jurisdiction(s)** with sanctions / "
+            f"export-control coverage of this entity:"
+        )
+        for (flag, country), lists in sorted(
+            top_buckets["sanctions"].items(), key=lambda kv: kv[0][1]
+        ):
+            deduped = list(dict.fromkeys(lists))
+            list_str = " · ".join(f"_{l}_" for l in deduped)
+            st.markdown(f"- {flag} **{country}** — {list_str}")
+    else:
+        st.info(
+            "No sanctioning jurisdictions found for this match. The entity "
+            "is either not on any government sanctions list, or appears only "
+            "in reference data (registries, FATCA, KYB)."
+        )
+    if top_buckets["counter_sanctions"]:
+        st.markdown("**Counter-sanctions (entity is target of):**")
+        for (flag, country), lists in sorted(
+            top_buckets["counter_sanctions"].items(), key=lambda kv: kv[0][1]
+        ):
+            deduped = list(dict.fromkeys(lists))
+            list_str = " · ".join(f"_{l}_" for l in deduped)
+            st.markdown(f"- {flag} **{country}** — {list_str}")
+    if top_buckets["other_risk"]:
+        st.markdown("**Other risk findings** _(debarment / regulatory / crime):_")
+        for (flag, country), lists in sorted(
+            top_buckets["other_risk"].items(), key=lambda kv: kv[0][1]
+        ):
+            deduped = list(dict.fromkeys(lists))
+            list_str = " · ".join(f"_{l}_" for l in deduped)
+            st.markdown(f"- {flag} **{country}** — {list_str}")
 
     st.markdown("### Candidates")
     for r, score, overlap, label, emoji, reason in candidate_verdicts:
