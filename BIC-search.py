@@ -94,38 +94,78 @@ def get_api_key() -> str:
 # OpenSanctions API calls
 # ---------------------------------------------------------------------------
 
+def _entity_contains_bik(entity: dict, bik: str) -> bool:
+    """Strict check: does this entity actually carry this exact BIK?
+
+    We accept a match only if the BIK appears as:
+      • the source ID ``ru-bik-{BIK}`` in ``referents``, or
+      • the literal value in any indexed identifier property
+        (``registrationNumber``, ``bikCode``, ``innCode``, ``ogrnCode``,
+        ``taxNumber``, ``identifiers``).
+    """
+    refs = [str(x) for x in (entity.get("referents") or [])]
+    if f"ru-bik-{bik}" in refs:
+        return True
+    props = entity.get("properties", {}) or {}
+    for key in ("registrationNumber", "bikCode", "innCode", "ogrnCode",
+                "taxNumber", "identifiers"):
+        for v in (props.get(key) or []):
+            if str(v) == bik:
+                return True
+    return False
+
+
 @st.cache_data(show_spinner=False, ttl=3600)
 def lookup_bank_in_cbr_registry(bik: str, api_key: str) -> dict | None:
-    """Resolve a BIK to a bank entity in OpenSanctions' CBR banking registry.
+    """Resolve a Russian BIK to an OpenSanctions entity — strict, no guessing.
 
-    Uses the /search endpoint scoped to the `ru_cbr_banks` dataset. We pass
-    the BIK as the query text — the search index covers identifiers,
-    so a precise match is returned for any valid BIK.
+    The original implementation used ``q={BIK}`` which is *full-text*
+    search — ElasticSearch happily returned the top-scoring hit even when
+    the BIK didn't actually appear in it. That produced both false
+    positives (random sanctioned bank surfaced for an unrelated BIK) and
+    false negatives (branch BIKs whose parent legal entity is indexed
+    under a different BIK weren't reached).
+
+    The fix:
+
+    1. Try precise field-scoped lookups in order. The most reliable is the
+       source-ID lookup ``referents:"ru-bik-{BIK}"`` on the ``default``
+       scope, which catches both standalone entities in the CBR registry
+       AND deduplicated sanctioned entities that carry the BIK as a
+       source ID. We then fall back to identifier-field lookups, and
+       finally a scoped text query inside the CBR registry.
+    2. *Strictly* validate every candidate via :func:`_entity_contains_bik`.
+       Never return an entity that doesn't actually contain this BIK.
+    3. No fuzzy ``results[0]`` fallback — better to report "unknown" than
+       to mis-attribute sanctions to the wrong institution.
     """
-    url = f"{OS_BASE}/search/{BANKS_DATASET}"
-    params = {"q": bik, "limit": 10}
-    resp = requests.get(
-        url, params=params, headers=os_headers(api_key), timeout=REQUEST_TIMEOUT
-    )
-    resp.raise_for_status()
-    data = resp.json()
-    results = data.get("results", [])
+    attempts: list[tuple[str, str]] = [
+        # (scope, lucene query) — most specific first
+        ("default",     f'referents:"ru-bik-{bik}"'),
+        ("default",     f'identifiers:"{bik}"'),
+        (BANKS_DATASET, f'identifiers:"{bik}"'),
+        (BANKS_DATASET, bik),  # text-mode fallback inside the CBR dataset only
+    ]
 
-    # Prefer results where the BIK appears literally in identifiers/registrationNumber
-    for r in results:
-        props = r.get("properties", {}) or {}
-        haystack = (
-            (props.get("registrationNumber") or [])
-            + (props.get("bikCode") or [])
-            + (props.get("ogrnCode") or [])
-            + (props.get("innCode") or [])
-        )
-        haystack = [str(x) for x in haystack]
-        if any(bik in v or v in bik for v in haystack):
-            return r
+    for scope, q in attempts:
+        url = f"{OS_BASE}/search/{scope}"
+        try:
+            resp = requests.get(
+                url,
+                params={"q": q, "limit": 10},
+                headers=os_headers(api_key),
+                timeout=REQUEST_TIMEOUT,
+            )
+            resp.raise_for_status()
+        except requests.RequestException:
+            continue
+        results = resp.json().get("results", []) or []
+        for r in results:
+            if _entity_contains_bik(r, bik):
+                return r
+        # else: every result for this query failed strict validation → try next
 
-    # Fallback: highest-ranked result if anything was returned
-    return results[0] if results else None
+    return None
 
 
 @st.cache_data(show_spinner=False, ttl=3600)
@@ -601,7 +641,18 @@ def screen_bik(bik_raw: str, api_key: str, scope: str) -> dict:
 
     if not bank:
         result["status"] = "unknown"
-        result["error"] = "No bank found in CBR registry for this BIK."
+        result["error"] = (
+            "No OpenSanctions entity carries this BIK as an identifier.\n\n"
+            "Possible reasons:\n"
+            "• The BIK is invalid or a typo.\n"
+            "• The bank's licence was recently revoked and the entry was "
+            "dropped from the CBR feed.\n"
+            "• The BIK is too new to be in the OpenSanctions snapshot "
+            "(the dataset refreshes daily).\n"
+            "• OpenSanctions doesn't index this particular branch BIK.\n\n"
+            "Cross-check the BIK on opensanctions.org directly, and on the "
+            "CBR's own registry (cbr.ru) before acting on this result."
+        )
         return result
     result["bank"] = bank
 
