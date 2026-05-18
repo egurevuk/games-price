@@ -945,6 +945,46 @@ def match_against_sanctions(
     return resp.json()
 
 
+def _pick_canonical_sanctioned_hit(match_response: dict) -> dict | None:
+    """Find the best confirmed sanctioned-bank candidate in a /match response.
+
+    Used by ``screen_bik`` when the bank was resolved via the directory
+    (synthetic entity, no OS ID) — we want to swap to the canonical OS
+    entity if /match found a sanctioned bank by name + SWIFT. Returns the
+    raw candidate dict (with ``id``, ``caption``, ``score``, ``match``,
+    ``datasets``, ``topics``) or ``None`` if no confirmed match.
+
+    Selection rules:
+    1. Candidate must have ``match=True`` (logic-v2 confirmed it).
+    2. Candidate must show at least one sanctions signal — topics include
+       'sanction' OR it appears in a specific sanctions dataset.
+    3. Highest-scoring candidate wins.
+    """
+    if not match_response:
+        return None
+    results = (
+        match_response.get("responses", {})
+        .get("q1", {})
+        .get("results", [])
+    ) or []
+    confirmed = [r for r in results if r.get("match")]
+    if not confirmed:
+        return None
+
+    def has_sanction_signal(r: dict) -> bool:
+        topics = r.get("topics") or []
+        if any("sanction" == t or t.startswith("sanction") for t in topics):
+            return True
+        datasets = set(r.get("datasets") or [])
+        return bool(datasets & SANCTIONS_DATASETS_HINTS)
+
+    sanctioned = [r for r in confirmed if has_sanction_signal(r)]
+    if not sanctioned:
+        return None
+    sanctioned.sort(key=lambda r: r.get("score", 0.0), reverse=True)
+    return sanctioned[0]
+
+
 # ---------------------------------------------------------------------------
 # Verdict logic
 # ---------------------------------------------------------------------------
@@ -1445,18 +1485,34 @@ def render_match_table(top_hits: list[dict]) -> None:
 def screen_bik(bik_raw: str, api_key: str, scope: str) -> dict:
     """Run the full pipeline for a single BIK and return a result dict.
 
-    Resolution strategy:
-      1. Strict OpenSanctions index lookup (covers head-office BIKs of
-         sanctioned banks, e.g. 044525974 → Tinkoff).
-      2. If miss → fetch BIK metadata from the external CBR directory
-         (bankirsha.com). If it's a branch BIK with a head-office BIK
-         pointer (e.g. 044030653 → 044525225), re-query OpenSanctions
-         against the head office. That's the common case for branches of
-         sanctioned banks (Sberbank, VTB, etc.).
-      3. If even the head office isn't indexed → build a synthetic entity
-         from the directory data and let /match find the parent legal
-         entity by fuzzy name + SWIFT BIC.
-      4. If the BIK isn't in the CBR directory at all → unknown.
+    Resolution strategy (directory-first):
+
+      1. **CBR directory is authoritative for BIK→bank mapping.** Try the
+         mirror chain (bankirsha.com → bik10.ru → banklab.ru) to get the
+         bank name, SWIFT BIC, and (for branch BIKs) the head-office BIK.
+         The CBR is the single source of truth for which bank a BIK
+         belongs to — OpenSanctions' BIK referents can be set by ANY
+         sanctioned entity whose bank account is at that BIK (e.g. Ukraine
+         NSDC records charities' bank account BIKs as referents), so we
+         can't trust a direct ``/entities/ru-bik-{X}`` lookup to return
+         the bank itself.
+
+      2. If the directory says it's a branch, recursively fetch the
+         head-office info from the directory. We screen the head office
+         because the head office carries the legal-entity-level sanctions.
+
+      3. Search OpenSanctions by NAME+SWIFT using ``/match`` (sanctions
+         scope). If a confirmed sanctioned entity is found, fetch the
+         canonical OS entity for the verdict and display. Otherwise the
+         synthetic directory-built entity is used (CLEAR/REVIEW based on
+         the OhMySwift whitelist).
+
+      4. **Fallback when ALL directory mirrors are unreachable**: drop
+         back to the OpenSanctions identifier lookup
+         (``lookup_bank_in_cbr_registry``), which validates that the
+         returned entity is actually a bank. Apply parent-bank name
+         detection as a final safety net for branches of major sanctioned
+         banks.
     """
     bik = normalize_bik(bik_raw)
     result: dict[str, Any] = {
@@ -1475,85 +1531,66 @@ def screen_bik(bik_raw: str, api_key: str, scope: str) -> dict:
         result["error"] = "BIK must be 8 or 9 digits."
         return result
 
-    # ---- Stage 1: strict OpenSanctions index lookup -----------------------
-    try:
-        bank = lookup_bank_in_cbr_registry(bik, api_key)
-    except requests.HTTPError as exc:
-        result["error"] = f"OpenSanctions lookup failed: {exc.response.status_code} {exc.response.text[:200]}"
-        return result
-    except Exception as exc:
-        result["error"] = f"OpenSanctions lookup failed: {exc}"
-        return result
-
-    if bank:
-        result["resolved_via"] = "OpenSanctions index (direct BIK match)"
-
-    # ---- Stage 2: consult CBR directory to detect branch BIKs -----------
-    #
-    # OpenSanctions' ru_cbr_banks dataset has SEPARATE entries for every
-    # branch BIK (e.g. 044030653 = Sberbank Severo-Zapadny branch is its own
-    # entity, distinct from the head office at 044525225). The branch entity
-    # is NOT directly tagged as sanctioned even though its parent is, which
-    # would produce a false-negative CLEAR verdict for branches of sanctioned
-    # banks. So we ALWAYS consult bankirsha.com — even when Stage 1 found
-    # something — to detect a branch relationship and re-resolve to the
-    # head office.
+    # ---- Step 1: directory is the source of truth for BIK→bank ---------
     info = resolve_bik_via_directory(bik)
+    bank: dict | None = None
+    head_office_info: dict | None = None
+    head_bik: str | None = None
+
     if info:
         result["directory_info"] = info
+        # ---- Step 2: if branch, get head office info from directory ----
         head_bik = info.get("headOfficeBik")
         if head_bik and head_bik != bik:
-            # It's a branch — re-query OpenSanctions for the head-office BIK
-            # and use that as the bank for the verdict. Branch BIKs inherit
-            # the head office's sanctions status.
-            try:
-                head_bank = lookup_bank_in_cbr_registry(head_bik, api_key)
-            except Exception:
-                head_bank = None
-            if head_bank:
+            head_office_info = resolve_bik_via_directory(head_bik) or None
+            if head_office_info:
+                screening_info = head_office_info
+                screening_bik = head_bik
                 branch_label = info.get("fullName") or info.get("name") or "branch"
-                bank = head_bank
                 result["resolved_via"] = (
                     f"Branch BIK {bik} (\"{branch_label}\") → head-office "
-                    f"BIK {head_bik}. Branch inherits the head office's "
-                    f"sanctions status."
+                    f"BIK {head_bik} via CBR directory "
+                    f"({info.get('_source', 'mirror')}). Branch inherits the "
+                    f"head office's sanctions status."
                 )
                 result["is_branch"] = True
                 result["head_office_bik"] = head_bik
+            else:
+                # Directory says branch but head office mirror lookup failed
+                # — fall back to name-based parent detection below
+                screening_info = info
+                screening_bik = bik
+        else:
+            screening_info = info
+            screening_bik = bik
 
-    # ---- Stage 3: build a synthetic entity if we still have nothing -----
-    if not bank and info:
-        bank = _synthetic_entity_from_directory(bik, info)
-        result["resolved_via"] = (
-            "CBR directory (not indexed by OpenSanctions; "
-            "/match performed by name + SWIFT)"
-        )
-
-    # ---- Stage 3.5: name-based parent-bank fallback ---------------------
-    # If the entity we resolved looks like a regional subdivision of a major
-    # sanctioned Russian bank (Sberbank, VTB, Alfa, Tinkoff, etc.), swap to
-    # the parent legal entity. This catches cases the directory chain
-    # missed — including when ALL mirrors are blocked, since this step uses
-    # only OpenSanctions and an in-memory token map.
-    #
-    # We trigger this when:
-    #   • bank is set (Stage 1 or 2 found something)
-    #   • we did NOT already resolve to a head office via directory (stage 2)
-    #   • the resolved entity name contains a known parent-bank token
-    #   • that parent's head-office BIK differs from the current BIK
-    if bank and not result.get("is_branch"):
-        parent = detect_parent_bank(bank, current_bik=bik)
-        if parent:
-            try:
-                parent_bank = lookup_bank_in_cbr_registry(parent["head_bik"], api_key)
-            except Exception:
-                parent_bank = None
-            if parent_bank:
-                original_name = (
-                    (bank.get("caption") or "")
-                    or ((bank.get("properties") or {}).get("name") or [""])[0]
-                )
-                bank = parent_bank
+        # ---- Step 2b: name-based parent detection (safety net) -----------
+        # If the directory data alone didn't identify a parent (e.g. a
+        # regional center like "СЕВЕРО-ЗАПАДНЫЙ БАНК ПАО СБЕРБАНК" that
+        # isn't recorded as a branch in CBR), inspect the name for known
+        # parent bank tokens and resolve to that parent's head office.
+        if not result.get("is_branch"):
+            entity_for_parent_check = _synthetic_entity_from_directory(
+                screening_bik, screening_info
+            )
+            parent = detect_parent_bank(entity_for_parent_check, current_bik=screening_bik)
+            if parent:
+                parent_info = resolve_bik_via_directory(parent["head_bik"])
+                if parent_info:
+                    screening_info = parent_info
+                    screening_bik = parent["head_bik"]
+                    head_bik = parent["head_bik"]
+                    head_office_info = parent_info
+                else:
+                    # Use parent name even without directory data
+                    screening_info = {
+                        "fullName": parent["name"],
+                        "name":     parent["name"],
+                        "_source":  "name_detection",
+                    }
+                    screening_bik = parent["head_bik"]
+                    head_bik = parent["head_bik"]
+                original_name = info.get("fullName") or info.get("name") or ""
                 result["resolved_via"] = (
                     f"BIK {bik} (\"{original_name}\") detected as a "
                     f"subdivision of {parent['name']} (token "
@@ -1565,12 +1602,62 @@ def screen_bik(bik_raw: str, api_key: str, scope: str) -> dict:
                 result["head_office_bik"] = parent["head_bik"]
                 result["parent_detected_via"] = "name_token"
 
-    # ---- Stage 4: safety net for branches we couldn't auto-resolve -----
-    # If the entity name still looks like a branch (e.g. starts with
-    # "ФИЛИАЛ" / "BRANCH") but we never swapped to a head office — usually
-    # because bankirsha.com was unreachable — flag this for the UI so the
-    # verdict isn't silently trusted. Classify will downgrade the verdict
-    # to REVIEW with a clear note.
+        if not result.get("resolved_via"):
+            result["resolved_via"] = (
+                f"CBR directory ({screening_info.get('_source', 'mirror')})"
+            )
+
+        # ---- Step 3: search OpenSanctions by name + SWIFT via /match ----
+        bank = _synthetic_entity_from_directory(screening_bik, screening_info)
+    else:
+        # ---- Fallback: OS identifier lookup (directory mirrors blocked) -
+        try:
+            bank = lookup_bank_in_cbr_registry(bik, api_key)
+        except requests.HTTPError as exc:
+            result["error"] = (
+                f"OpenSanctions lookup failed: "
+                f"{exc.response.status_code} {exc.response.text[:200]}"
+            )
+            return result
+        except Exception as exc:
+            result["error"] = f"OpenSanctions lookup failed: {exc}"
+            return result
+
+        if bank:
+            result["resolved_via"] = (
+                "OpenSanctions identifier lookup (CBR directory mirrors "
+                "unreachable — name-based screening unavailable)"
+            )
+            # Parent-bank detection still applies in fallback mode: if the
+            # entity name contains a known parent token (e.g. СБЕРБАНК),
+            # re-resolve to the parent's head-office BIK.
+            parent = detect_parent_bank(bank, current_bik=bik)
+            if parent:
+                try:
+                    parent_bank = lookup_bank_in_cbr_registry(
+                        parent["head_bik"], api_key
+                    )
+                except Exception:
+                    parent_bank = None
+                if parent_bank:
+                    original_name = (
+                        (bank.get("caption") or "")
+                        or ((bank.get("properties") or {}).get("name") or [""])[0]
+                    )
+                    bank = parent_bank
+                    result["resolved_via"] = (
+                        f"BIK {bik} (\"{original_name}\") detected as a "
+                        f"subdivision of {parent['name']} (token "
+                        f"\"{parent['matched_token']}\" in name) → resolved "
+                        f"to head-office BIK {parent['head_bik']} via "
+                        f"OpenSanctions (directory mirrors unreachable)."
+                    )
+                    result["is_branch"] = True
+                    result["head_office_bik"] = parent["head_bik"]
+                    result["parent_detected_via"] = "name_token"
+
+    # Final safety net: warn if the entity name still looks like a branch
+    # but we couldn't resolve it to a head office
     if bank and not result.get("is_branch") and looks_like_branch_entity(bank):
         result["branch_unresolved"] = True
 
@@ -1608,6 +1695,28 @@ def screen_bik(bik_raw: str, api_key: str, scope: str) -> dict:
         result["error"] = f"/match failed: {exc}"
         return result
     result["match"] = match_response
+
+    # If we resolved the bank via the directory (no OS entity ID), check
+    # /match results for a confirmed sanctioned match — and if found, fetch
+    # the canonical OS entity so the UI shows the actual sanctioned bank
+    # name (e.g. "Joint Stock Company Sberbank") with full designations
+    # rather than the directory-derived label.
+    if not bank.get("id"):
+        canonical = _pick_canonical_sanctioned_hit(match_response)
+        if canonical:
+            try:
+                hydrated = fetch_full_entity(canonical["id"], api_key)
+            except Exception:
+                hydrated = None
+            if hydrated and _is_bank_entity(hydrated):
+                result["bank_full"] = hydrated
+                result["bank"] = hydrated
+                # Preserve the resolution narrative but append the match info
+                prior = result.get("resolved_via") or ""
+                result["resolved_via"] = (
+                    f"{prior} → matched to canonical OpenSanctions entity "
+                    f'"{hydrated.get("caption", "")}" via /match (name + SWIFT).'
+                )
 
     # OhMySwift whitelist check — independent signal feeding the verdict
     try:
@@ -1745,20 +1854,29 @@ with st.sidebar:
     st.divider()
     st.markdown(
         "**About**\n\n"
-        "* BIK resolved via OpenSanctions `ru_cbr_banks` dataset "
-        "(Central Bank of Russia registry, refreshed daily).\n"
-        "* Branch BIKs resolved to head office via a chain of CBR "
-        "directory mirrors: bankirsha.com → bik10.ru → banklab.ru. "
-        "First successful mirror wins.\n"
-        "* Sanctions match via `/match` endpoint with `logic-v2` scoring.\n"
+        "* **CBR directory is the source of truth** for BIK→bank mapping. "
+        "Tried in order: bankirsha.com → bik10.ru → banklab.ru. The first "
+        "mirror that responds wins.\n"
+        "* For branch BIKs, the directory's `headOfficeBik` pointer is "
+        "followed to the parent bank. A name-based fallback also detects "
+        "subdivisions of major Russian banks (Sberbank, VTB, Alfa, "
+        "Tinkoff, Gazprombank, etc.) when the directory doesn't link "
+        "them explicitly.\n"
+        "* Sanctions check runs via OpenSanctions `/match` (name + SWIFT + "
+        "jurisdiction = Russia) in the chosen scope. If `/match` confirms "
+        "a sanctioned bank, the canonical OS entity replaces the "
+        "directory-derived one for display.\n"
+        "* **Fallback path** when all directory mirrors are unreachable: "
+        "OpenSanctions identifier lookup against `ru_cbr_banks` dataset, "
+        "with bank-entity validation (rejects e.g. sanctioned charities "
+        "whose account BIK matches).\n"
         "* OhMySwift whitelist applied as a **hybrid rule**: bank on list "
         "⇒ CLEAR; bank not on list AND OpenSanctions also clean ⇒ "
-        "REVIEW REQUIRED (rather than auto-sanctioned, because the list "
-        "is known to be incomplete for small regional banks). Live data "
-        "preferred; bundled snapshot used when ohmyswift.io is unreachable.\n"
-        "* An OpenSanctions-confirmed sanction always wins and is final. "
-        "OpenSanctions covers more jurisdictions (UK, CA, JP, CH, AU, UA) "
-        "than OhMySwift's US-SDN + EU scope."
+        "REVIEW REQUIRED. Live data preferred; bundled snapshot used when "
+        "ohmyswift.io is unreachable.\n"
+        "* OpenSanctions covers more jurisdictions (UK, CA, JP, CH, AU, UA) "
+        "than OhMySwift's US-SDN + EU scope, and always wins when it "
+        "flags a bank."
     )
 
 # --- Main pane ------------------------------------------------------------
