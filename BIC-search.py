@@ -296,6 +296,157 @@ def _synthetic_entity_from_directory(bik: str, info: dict) -> dict:
     }
 
 
+# ---------------------------------------------------------------------------
+# OhMySwift "not-under-sanctions" whitelist
+# ---------------------------------------------------------------------------
+#
+# ohmyswift.io publishes a curated list of Russian banks NOT on the US SDN
+# list and NOT on the EU sanctions list. The page is updated regularly and
+# is keyed by SWIFT/BIC. We use it as a positive signal: a bank on the list
+# is confidently CLEAR, a bank missing from the list is REVIEW REQUIRED.
+#
+# IMPORTANT SCOPE CAVEAT: the list only reflects US SDN + EU. Banks
+# sanctioned by UK / Canada / Switzerland / Australia / Japan / Ukraine
+# would still appear on this whitelist — that's why we KEEP the
+# OpenSanctions /match check and let it win when it flags a bank.
+# Conversely, the list is known to be incomplete: small regional banks
+# (Bank Yekaterinburg, etc.) and ruble-only institutions without SWIFT
+# membership may be missing even though they are not actually sanctioned.
+# We therefore raise REVIEW rather than SANCTIONED when a bank is missing.
+
+OHMYSWIFT_URL = "https://ohmyswift.io/ne-pod-sankciyami-spisok"
+OHMYSWIFT_UA = "Mozilla/5.0 (BIK-Screener; +stape.io)"
+
+
+def _normalize_swift(code: str) -> str:
+    """Normalize SWIFT/BIC to its 8-char institution+country+location code.
+
+    SWIFT codes are 8 or 11 chars: ``BBBBCCLL[XXX]`` where the optional
+    3-char suffix designates a branch. We strip the suffix so the two
+    forms compare equal.
+    """
+    if not code:
+        return ""
+    s = str(code).upper().strip()
+    return s[:8] if len(s) >= 8 else s
+
+
+@st.cache_data(show_spinner=False, ttl=86400)  # refresh daily
+def fetch_ohmyswift_whitelist() -> dict | None:
+    """Download and parse the ohmyswift.io 'not sanctioned' list.
+
+    Returns ``{"swifts": set[str], "by_swift": dict[str, dict], "updated": str}``
+    where each entry in ``by_swift`` carries ``{"swift", "name_ru", "name_en"}``,
+    or ``None`` on failure (which the caller treats as "whitelist unavailable").
+    """
+    try:
+        resp = requests.get(
+            OHMYSWIFT_URL,
+            timeout=20,
+            headers={"User-Agent": OHMYSWIFT_UA, "Accept-Language": "ru,en"},
+        )
+        resp.raise_for_status()
+    except requests.RequestException:
+        return None
+
+    html = resp.text
+    # Each row has: <td><a href="...">SWIFT</a></td> <td>russian name</td> <td>english name</td>
+    row_re = re.compile(
+        r'<td[^>]*>\s*<a[^>]*href="[^"]*/swift-codes/[^"]+">([A-Z0-9]+)</a>\s*</td>\s*'
+        r'<td[^>]*>(.*?)</td>\s*'
+        r'<td[^>]*>(.*?)</td>',
+        re.IGNORECASE | re.DOTALL,
+    )
+    by_swift: dict[str, dict] = {}
+    for m in row_re.finditer(html):
+        raw_swift = m.group(1).strip().upper()
+        name_ru = re.sub(r"<[^>]+>", "", m.group(2)).strip()
+        name_en = re.sub(r"<[^>]+>", "", m.group(3)).strip()
+        key = _normalize_swift(raw_swift)
+        if not key:
+            continue
+        by_swift[key] = {
+            "swift": raw_swift,
+            "name_ru": unescape(name_ru),
+            "name_en": unescape(name_en),
+        }
+
+    if not by_swift:
+        return None  # parsing failed
+
+    # Updated-date pulled from page meta if present
+    m = re.search(r"Дата обновления:\s*([0-9.]+)", html)
+    updated = m.group(1) if m else None
+
+    return {
+        "swifts": set(by_swift.keys()),
+        "by_swift": by_swift,
+        "updated": updated,
+        "count": len(by_swift),
+    }
+
+
+def check_ohmyswift_whitelist(bank: dict) -> dict:
+    """Check whether the resolved bank entity appears in the OhMySwift list.
+
+    Match strategy: collect every SWIFT-like identifier from the bank's
+    properties + referents, normalize to 8 chars, and look up. Returns::
+
+        {
+            "in_list":      bool,
+            "matched_swift": str | None,
+            "matched_entry": dict | None,
+            "checked_swifts": list[str],
+            "list_meta":    {"count": int, "updated": str | None} | None,
+            "available":    bool,            # False if we couldn't load the list
+        }
+    """
+    out = {
+        "in_list": False,
+        "matched_swift": None,
+        "matched_entry": None,
+        "checked_swifts": [],
+        "list_meta": None,
+        "available": False,
+    }
+
+    wl = fetch_ohmyswift_whitelist()
+    if not wl:
+        return out  # leave available=False; caller decides how to handle
+    out["available"] = True
+    out["list_meta"] = {"count": wl["count"], "updated": wl["updated"]}
+
+    bank = bank or {}
+    props = bank.get("properties", {}) or {}
+
+    # Harvest every SWIFT we can find on this entity
+    candidates: list[str] = []
+    for key in ("swiftBic", "swift", "bicCode"):
+        for v in (props.get(key) or []):
+            candidates.append(str(v))
+    # bic-XXXXXXXX referents
+    for ref in (bank.get("referents") or []):
+        s = str(ref)
+        if s.lower().startswith("bic-"):
+            candidates.append(s[4:])
+
+    seen: set[str] = set()
+    checked: list[str] = []
+    for raw in candidates:
+        norm = _normalize_swift(raw)
+        if not norm or norm in seen:
+            continue
+        seen.add(norm)
+        checked.append(norm)
+        if norm in wl["swifts"]:
+            out["in_list"] = True
+            out["matched_swift"] = norm
+            out["matched_entry"] = wl["by_swift"][norm]
+            break
+    out["checked_swifts"] = checked
+    return out
+
+
 @st.cache_data(show_spinner=False, ttl=3600)
 def fetch_full_entity(entity_id: str, api_key: str) -> dict | None:
     """Get a fully-nested entity record by ID.
@@ -397,13 +548,37 @@ SANCTIONS_DATASETS_HINTS = {
 }
 
 
-def classify(bank_entity: dict, match_response: dict) -> dict:
-    """Combine entity-level evidence and /match evidence into a verdict.
+def classify(
+    bank_entity: dict,
+    match_response: dict,
+    whitelist: dict | None = None,
+) -> dict:
+    """Combine entity-level evidence, /match evidence, and the OhMySwift
+    whitelist into a final verdict.
+
+    Decision logic (in order):
+
+      1. **OpenSanctions confirmed sanction** (any list — US, EU, UK, CA, JP,
+         CH, AU, UA, etc.) — verdict is SANCTIONED. This wins over the
+         whitelist because OpenSanctions covers more jurisdictions than the
+         US-SDN-and-EU-only OhMySwift list.
+      2. **In OhMySwift whitelist** and no OpenSanctions hit → CLEAR (with a
+         caveat that the list covers only US SDN + EU).
+      3. **Not in OhMySwift whitelist** (and not OpenSanctions-confirmed) →
+         REVIEW REQUIRED. The OhMySwift list is known to be incomplete (it
+         misses small regional banks like Bank Yekaterinburg even though they
+         are not actually sanctioned), so a missing-from-whitelist signal
+         alone is not strong enough to declare SANCTIONED. The reason text
+         explains the conflict and recommends checking the official OFAC /
+         EU lists directly.
+      4. **Whitelist unavailable** (couldn't fetch the page) → fall back to
+         the prior OpenSanctions-only behaviour with a REVIEW threshold.
 
     Returns dict with:
         status:    "sanctioned" | "clear" | "review"
         reasons:   list[str] human-readable evidence
         top_hits:  list[dict] sanctions candidates with scores
+        whitelist: the input whitelist check (echoed for the UI)
     """
     reasons: list[str] = []
     top_hits: list[dict] = []
@@ -411,34 +586,27 @@ def classify(bank_entity: dict, match_response: dict) -> dict:
 
     bank_entity = bank_entity or {}
     props = bank_entity.get("properties", {}) or {}
+    opensanctions_confirmed = False
 
-    # 1) The bank registry entity is itself marked as a sanctions target.
-    #    OpenSanctions sets `target=True` on entities that are designated
-    #    on any watchlist. Because the CBR registry is deduplicated against
-    #    sanctions lists, this is the most reliable signal.
+    # === A. Collect every OpenSanctions signal first ====================
+
     if bank_entity.get("target") is True:
-        status = "sanctioned"
+        opensanctions_confirmed = True
         reasons.append("Bank entity is flagged as a sanctions `target` in OpenSanctions.")
 
-    # 2) Topic-based check (belt-and-braces; covers entities where the
-    #    search response includes topics but not target=True).
     topics = props.get("topics") or bank_entity.get("topics") or []
-    if is_sanctioned_topic(topics) and status != "sanctioned":
-        status = "sanctioned"
+    if is_sanctioned_topic(topics):
+        opensanctions_confirmed = True
         reasons.append(f"Bank entity carries sanctions topic ({', '.join(topics)}).")
 
-    # 3) Dataset-membership check — if the entity belongs to any dataset
-    #    other than `ru_cbr_banks` AND that dataset looks sanctions-related,
-    #    flag as sanctioned. (Pure debarment/PEP datasets won't trigger.)
     datasets = bank_entity.get("datasets") or []
     other_ds = [d for d in datasets if d != BANKS_DATASET]
     sanction_ds_hits = [d for d in other_ds if d in SANCTIONS_DATASETS_HINTS
                         or "sanction" in d.lower() or "ofac" in d.lower()]
-    if sanction_ds_hits and status != "sanctioned":
-        status = "sanctioned"
+    if sanction_ds_hits:
+        opensanctions_confirmed = True
         reasons.append(f"Bank appears in sanctions dataset(s): {', '.join(sanction_ds_hits)}.")
 
-    # 4) Independent verification via /match
     q1 = (match_response or {}).get("responses", {}).get("q1", {})
     for hit in q1.get("results", []) or []:
         score = float(hit.get("score") or 0)
@@ -455,28 +623,87 @@ def classify(bank_entity: dict, match_response: dict) -> dict:
             "schema": hit.get("schema"),
         })
         if hit.get("match") and (is_sanctioned_topic(hit_topics) or hit.get("target")):
-            if status != "sanctioned":
-                status = "sanctioned"
+            opensanctions_confirmed = True
             reasons.append(
                 f"/match returned a confirmed match: "
                 f"\"{hit.get('caption')}\" score={score:.2f}"
                 + (f" topics=[{', '.join(hit_topics)}]" if hit_topics else "")
             )
 
-    # 5) High-score but unconfirmed → REVIEW
-    if status == "clear" and top_hits:
-        best = max(top_hits, key=lambda x: x["score"])
-        if best["score"] >= SANCTION_SCORE_THRESHOLD:
-            status = "review"
+    # === B. Apply the decision logic ====================================
+
+    wl = whitelist or {}
+    wl_available = bool(wl.get("available"))
+    wl_in_list = bool(wl.get("in_list"))
+
+    if opensanctioned := opensanctions_confirmed:
+        status = "sanctioned"
+
+    elif wl_available and wl_in_list:
+        status = "clear"
+        entry = wl.get("matched_entry") or {}
+        reasons.append(
+            f"Bank is on the OhMySwift 'not sanctioned' whitelist "
+            f"(SWIFT `{wl.get('matched_swift')}` — {entry.get('name_en') or entry.get('name_ru')}). "
+            f"Note: this list covers **US SDN + EU only** — not UK, Canada, "
+            f"Switzerland, Japan, Australia, or Ukraine."
+        )
+
+    elif wl_available and not wl_in_list:
+        # Hybrid rule: bank is NOT on the OhMySwift whitelist AND OpenSanctions
+        # has not flagged it. Both signals are weak on their own — OhMySwift's
+        # 306-bank list is known to be incomplete (small regional banks like
+        # Bank Yekaterinburg get missed even though they aren't sanctioned),
+        # and OpenSanctions may have gaps for less-covered jurisdictions.
+        # We therefore raise REVIEW REQUIRED rather than declaring SANCTIONED.
+        status = "review"
+        checked = wl.get("checked_swifts") or []
+        if checked:
             reasons.append(
-                f"Top candidate \"{best['caption']}\" scored {best['score']:.2f} "
-                f"(≥ {SANCTION_SCORE_THRESHOLD:.2f} threshold). Manual review recommended."
+                f"Bank's SWIFT BIC(s) {', '.join(f'`{s}`' for s in checked)} "
+                f"are NOT on the OhMySwift 'not under US SDN / EU sanctions' "
+                f"list ({wl.get('list_meta', {}).get('count', '?')} entries, "
+                f"updated {wl.get('list_meta', {}).get('updated', 'recently')}), "
+                f"but OpenSanctions also shows no active sanctions designation. "
+                f"**Manual review recommended** — most often this happens because "
+                f"the bank is a small regional player that OhMySwift's curated "
+                f"list simply hasn't catalogued, not because it is actually "
+                f"sanctioned."
+            )
+        else:
+            reasons.append(
+                "This bank has no SWIFT/BIC we could check against the OhMySwift "
+                "whitelist, and OpenSanctions shows no active sanctions "
+                "designation. **Manual review recommended** — common for small "
+                "regional banks that lack SWIFT membership (ruble-only operations) "
+                "and aren't covered by either list. Verify directly with the bank "
+                "or against the official OFAC SDN / EU consolidated lists before "
+                "transacting."
             )
 
-    if status == "clear" and not reasons:
-        reasons.append("No matches above the alert threshold across sanctions lists.")
+    else:
+        # Whitelist unavailable → fall back to OpenSanctions-only thresholds
+        if top_hits:
+            best = max(top_hits, key=lambda x: x["score"])
+            if best["score"] >= SANCTION_SCORE_THRESHOLD:
+                status = "review"
+                reasons.append(
+                    f"Top candidate \"{best['caption']}\" scored {best['score']:.2f} "
+                    f"(≥ {SANCTION_SCORE_THRESHOLD:.2f}). Manual review recommended. "
+                    f"(OhMySwift whitelist unavailable.)"
+                )
+        if status == "clear" and not reasons:
+            reasons.append(
+                "No matches above the alert threshold across sanctions lists. "
+                "(OhMySwift whitelist unavailable — verdict based on OpenSanctions only.)"
+            )
 
-    return {"status": status, "reasons": reasons, "top_hits": top_hits}
+    return {
+        "status": status,
+        "reasons": reasons,
+        "top_hits": top_hits,
+        "whitelist": wl,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -865,7 +1092,14 @@ def screen_bik(bik_raw: str, api_key: str, scope: str) -> dict:
         return result
     result["match"] = match_response
 
-    verdict = classify(result["bank_full"], match_response)
+    # OhMySwift whitelist check — independent signal feeding the verdict
+    try:
+        whitelist_check = check_ohmyswift_whitelist(result["bank_full"] or bank)
+    except Exception:
+        whitelist_check = {"available": False}
+    result["whitelist"] = whitelist_check
+
+    verdict = classify(result["bank_full"], match_response, whitelist=whitelist_check)
     result["verdict"] = verdict
     result["status"] = verdict["status"]
     return result
@@ -937,14 +1171,33 @@ with st.sidebar:
         }[s],
     )
     st.divider()
+    # OhMySwift whitelist status
+    wl_meta = fetch_ohmyswift_whitelist()
+    if wl_meta:
+        st.markdown(
+            f"**📋 OhMySwift whitelist**  \n"
+            f"{wl_meta['count']} banks, "
+            f"updated {wl_meta.get('updated', '—')}  \n"
+            f"[Source ↗](https://ohmyswift.io/ne-pod-sankciyami-spisok)"
+        )
+        st.caption(
+            "⚠️ Scope: **US SDN + EU only**. Banks sanctioned by UK / "
+            "Canada / Switzerland / Japan / Australia / Ukraine may still "
+            "appear here — OpenSanctions catches those."
+        )
+    else:
+        st.caption("📋 OhMySwift whitelist unavailable")
+
+    st.divider()
     st.markdown(
         "**About**\n\n"
         "* BIK resolved via OpenSanctions `ru_cbr_banks` dataset "
         "(Central Bank of Russia registry, refreshed daily).\n"
+        "* Branch BIKs resolved via bankirsha.com → head-office BIK.\n"
         "* Sanctions match via `/match` endpoint with `logic-v2` scoring.\n"
-        "* The CBR dataset and many sanctions lists are deduplicated by "
-        "OpenSanctions, so a sanctioned bank shows up as a single entity "
-        "tagged with the `sanction` topic."
+        "* OhMySwift whitelist is applied as a strict rule: bank not on "
+        "list ⇒ treated as sanctioned, unless OpenSanctions confirms clear "
+        "across all jurisdictions."
     )
 
 # --- Main pane ------------------------------------------------------------
@@ -1015,6 +1268,36 @@ with tab_single:
                 st.write(f"**BIK:** `{res['bik']}`")
                 if res.get("resolved_via"):
                     st.caption(f"🔍 Resolved via: {res['resolved_via']}")
+
+                # OhMySwift whitelist mini-badge
+                wl = res.get("whitelist") or {}
+                if wl.get("available"):
+                    if wl.get("in_list"):
+                        meta = wl.get("list_meta") or {}
+                        st.success(
+                            f"📋 In **OhMySwift** whitelist  \n"
+                            f"SWIFT `{wl.get('matched_swift')}`  \n"
+                            f"_({meta.get('count', '?')} banks, "
+                            f"updated {meta.get('updated', 'recently')})_",
+                            icon="✅",
+                        )
+                    else:
+                        checked = wl.get("checked_swifts") or []
+                        if checked:
+                            st.error(
+                                f"📋 **Not** in OhMySwift whitelist  \n"
+                                f"checked: {', '.join(f'`{s}`' for s in checked)}",
+                                icon="🚫",
+                            )
+                        else:
+                            st.warning(
+                                "📋 No SWIFT BIC to check  \n"
+                                "_OhMySwift whitelist not applicable_",
+                                icon="❔",
+                            )
+                else:
+                    st.caption("📋 OhMySwift whitelist unavailable (offline?)")
+
             with top[1]:
                 if res["status"] == "error":
                     st.error(res["error"])
