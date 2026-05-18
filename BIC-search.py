@@ -165,6 +165,131 @@ def looks_like_branch_entity(entity: dict) -> bool:
     return False
 
 
+# Map of well-known major Russian banks to their canonical head-office BIK.
+# Each entry lists name tokens that, if found in a resolved entity's name,
+# strongly suggest the entity is a subdivision/branch of this parent bank.
+# This handles the case where:
+#   • OpenSanctions returns a branch entity that itself isn't sanctioned
+#     (e.g. "SBERBANK (SEVERO-ZAPADNY HEAD OFFICE)" — entity of interest only)
+#   • The directory mirror chain (bankirsha/bik10/banklab) is unreachable so
+#     we can't get the head-office BIK from there.
+# In that case, name-based detection lets us still resolve to the sanctioned
+# parent legal entity. Tokens are checked case-insensitively as substrings,
+# so "СБЕРБАНК" matches "СЕВЕРО-ЗАПАДНЫЙ БАНК ПАО СБЕРБАНК".
+#
+# We deliberately limit this list to ~15 of the largest Russian banks whose
+# branches are most likely to be confusingly named. Adding more is cheap
+# but maintenance cost grows.
+KNOWN_PARENT_BANKS: dict[str, dict] = {
+    "sberbank": {
+        "head_bik":  "044525225",
+        "tokens":    ["СБЕРБАНК", "SBERBANK", "СБЕР ", "SBER ", "ПАО СБЕРБ"],
+        "name":      "PJSC Sberbank",
+    },
+    "vtb": {
+        "head_bik":  "044525187",
+        "tokens":    [" ВТБ ", " VTB ", "БАНКА ВТБ", "BANK VTB", "ВТБ (ПАО)"],
+        "name":      "VTB Bank",
+    },
+    "alfa_bank": {
+        "head_bik":  "044525593",
+        "tokens":    ["АЛЬФА-БАНК", "ALFA-BANK", "ALFA BANK", "АЛЬФА БАНК"],
+        "name":      "Alfa-Bank",
+    },
+    "tinkoff": {
+        "head_bik":  "044525974",
+        "tokens":    ["ТИНЬКОФФ", "TINKOFF", "T-БАНК", "T-BANK", "ТБАНК",
+                      "TBANK", "Т-БАНК"],
+        "name":      "T-Bank (Tinkoff)",
+    },
+    "gazprombank": {
+        "head_bik":  "044525823",
+        "tokens":    ["ГАЗПРОМБАНК", "GAZPROMBANK"],
+        "name":      "Gazprombank",
+    },
+    "rosselkhozbank": {
+        "head_bik":  "044525111",
+        "tokens":    ["РОССЕЛЬХОЗБАНК", "ROSSELKHOZBANK", "ROSSELHOZBANK"],
+        "name":      "Rosselkhozbank",
+    },
+    "promsvyazbank": {
+        "head_bik":  "044525555",
+        "tokens":    ["ПРОМСВЯЗЬБАНК", "PROMSVYAZBANK", " ПСБ ", " PSB "],
+        "name":      "PSB (Promsvyazbank)",
+    },
+    "otkritie": {
+        "head_bik":  "044525297",
+        "tokens":    ["ОТКРЫТИЕ", "OTKRITIE", "OTKRYTIE", "OTKRITIYE"],
+        "name":      "Otkritie Bank",
+    },
+    "bank_rossiya": {
+        "head_bik":  "044030861",
+        "tokens":    ["БАНК РОССИЯ", "BANK ROSSIYA", "АБ РОССИЯ", "AB ROSSIYA"],
+        "name":      "Bank Rossiya",
+    },
+    "mkb": {
+        "head_bik":  "044525659",
+        "tokens":    [" МКБ ", " MKB ", "МОСКОВСКИЙ КРЕДИТНЫЙ БАНК",
+                      "MOSCOW CREDIT BANK"],
+        "name":      "Moscow Credit Bank (MKB)",
+    },
+    "sovkombank": {
+        "head_bik":  "043469743",
+        "tokens":    ["СОВКОМБАНК", "SOVCOMBANK", "SOVKOMBANK"],
+        "name":      "Sovcombank",
+    },
+    "tochka": {
+        "head_bik":  "044525104",
+        "tokens":    [" ТОЧКА ", " TOCHKA ", "БАНК ТОЧКА", "TOCHKA BANK"],
+        "name":      "Bank Tochka",
+    },
+    "raiffeisenbank": {
+        "head_bik":  "044525700",
+        "tokens":    ["РАЙФФАЙЗЕН", "RAIFFEISEN", "RZBM"],
+        "name":      "AO Raiffeisenbank",
+    },
+    "uralsib": {
+        "head_bik":  "044525787",
+        "tokens":    ["УРАЛСИБ", "URALSIB"],
+        "name":      "Uralsib Bank",
+    },
+    "rnkb": {
+        "head_bik":  "043510607",
+        "tokens":    [" РНКБ ", " RNKB ", "РОССИЙСКИЙ НАЦИОНАЛЬНЫЙ КОММЕРЧЕСКИЙ"],
+        "name":      "RNKB Bank",
+    },
+}
+
+
+def detect_parent_bank(entity: dict, current_bik: str | None = None) -> dict | None:
+    """If the entity name contains a known major Russian bank token, return
+    that parent bank's head-office descriptor. Otherwise None.
+
+    The check is done against the entity's caption, all name properties,
+    and aliases — case-insensitively, as substring containment.
+    """
+    if not entity:
+        return None
+    parts: list[str] = []
+    parts.append(str(entity.get("caption") or ""))
+    props = entity.get("properties", {}) or {}
+    for key in ("name", "alias", "previousName", "weakAlias"):
+        for v in (props.get(key) or []):
+            parts.append(str(v))
+    haystack = " ".join(parts).upper()
+    # Pad with spaces to make whole-token matches like " ВТБ " work even at edges
+    haystack = f" {haystack} "
+
+    for bank_key, info in KNOWN_PARENT_BANKS.items():
+        if info["head_bik"] == current_bik:
+            # Already the head office — no need to re-resolve to itself
+            continue
+        for token in info["tokens"]:
+            if token.upper() in haystack:
+                return {**info, "key": bank_key, "matched_token": token.strip()}
+    return None
+
+
 @st.cache_data(show_spinner=False, ttl=3600)
 def lookup_bank_in_cbr_registry(bik: str, api_key: str) -> dict | None:
     """Resolve a Russian BIK to an OpenSanctions entity — strict, no guessing.
@@ -1338,6 +1463,42 @@ def screen_bik(bik_raw: str, api_key: str, scope: str) -> dict:
             "CBR directory (not indexed by OpenSanctions; "
             "/match performed by name + SWIFT)"
         )
+
+    # ---- Stage 3.5: name-based parent-bank fallback ---------------------
+    # If the entity we resolved looks like a regional subdivision of a major
+    # sanctioned Russian bank (Sberbank, VTB, Alfa, Tinkoff, etc.), swap to
+    # the parent legal entity. This catches cases the directory chain
+    # missed — including when ALL mirrors are blocked, since this step uses
+    # only OpenSanctions and an in-memory token map.
+    #
+    # We trigger this when:
+    #   • bank is set (Stage 1 or 2 found something)
+    #   • we did NOT already resolve to a head office via directory (stage 2)
+    #   • the resolved entity name contains a known parent-bank token
+    #   • that parent's head-office BIK differs from the current BIK
+    if bank and not result.get("is_branch"):
+        parent = detect_parent_bank(bank, current_bik=bik)
+        if parent:
+            try:
+                parent_bank = lookup_bank_in_cbr_registry(parent["head_bik"], api_key)
+            except Exception:
+                parent_bank = None
+            if parent_bank:
+                original_name = (
+                    (bank.get("caption") or "")
+                    or ((bank.get("properties") or {}).get("name") or [""])[0]
+                )
+                bank = parent_bank
+                result["resolved_via"] = (
+                    f"BIK {bik} (\"{original_name}\") detected as a "
+                    f"subdivision of {parent['name']} (token "
+                    f"\"{parent['matched_token']}\" in name) → resolved to "
+                    f"head-office BIK {parent['head_bik']}. Branch inherits "
+                    f"the head office's sanctions status."
+                )
+                result["is_branch"] = True
+                result["head_office_bik"] = parent["head_bik"]
+                result["parent_detected_via"] = "name_token"
 
     # ---- Stage 4: safety net for branches we couldn't auto-resolve -----
     # If the entity name still looks like a branch (e.g. starts with
