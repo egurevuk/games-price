@@ -23,7 +23,39 @@ from typing import Any
 
 import requests
 import streamlit as st
-from transliterate import translit
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Inline Russian → Latin transliteration (GOST 7.79 / BGN-PCGN flavored).
+# Self-contained to keep deployment dependencies minimal — only streamlit and
+# requests are external. Matches the output of the `transliterate` library's
+# default Russian table (e.g. "ТБанк" → "TBank", "Москва" → "Moskva").
+# ─────────────────────────────────────────────────────────────────────────────
+
+_RU_TO_LAT: dict[str, str] = {
+    "а": "a", "б": "b", "в": "v", "г": "g", "д": "d", "е": "e", "ё": "jo",
+    "ж": "zh", "з": "z", "и": "i", "й": "j", "к": "k", "л": "l", "м": "m",
+    "н": "n", "о": "o", "п": "p", "р": "r", "с": "s", "т": "t", "у": "u",
+    "ф": "f", "х": "h", "ц": "ts", "ч": "ch", "ш": "sh", "щ": "sch",
+    "ъ": '"', "ы": "y", "ь": "'", "э": "je", "ю": "ju", "я": "ja",
+}
+
+
+def transliterate_ru(text: str | None) -> str:
+    """Russian Cyrillic → Latin. Non-Cyrillic chars pass through unchanged."""
+    if not text:
+        return ""
+    out: list[str] = []
+    for ch in text:
+        repl = _RU_TO_LAT.get(ch.lower())
+        if repl is None:
+            out.append(ch)
+        elif ch.isupper():
+            # For multi-char replacements only capitalize the first letter
+            # so "Ц" → "Ts" not "TS", consistent with library output.
+            out.append(repl[0].upper() + repl[1:])
+        else:
+            out.append(repl)
+    return "".join(out)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Config / secrets
@@ -205,16 +237,6 @@ def bik_info_lookup(bic: str) -> dict[str, Any]:
     if isinstance(data, dict) and data.get("error"):
         return {"error": data["error"]}
     return data
-
-
-def transliterate_ru(text: str | None) -> str:
-    """Russian → Latin transliteration. Safe on None/empty."""
-    if not text:
-        return ""
-    try:
-        return translit(text, "ru", reversed=True)
-    except Exception:
-        return text
 
 
 # ─────────────────────────────────────────────────────────────────────────────
