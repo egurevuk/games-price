@@ -355,6 +355,20 @@ def screen(bik: str, api_key: str | None) -> dict[str, Any]:
 # UI
 # ---------------------------------------------------------------------------
 
+def get_api_key() -> str | None:
+    """Read the OpenSanctions API key from Streamlit secrets.
+
+    Returns ``None`` when no secrets file is configured (local dev without
+    ``.streamlit/secrets.toml``). The key is optional — anonymous access
+    works at a lower rate limit.
+    """
+    try:
+        return st.secrets.get("OPENSANCTIONS_API_KEY") or None
+    except (FileNotFoundError, KeyError, AttributeError):
+        # No secrets.toml on disk → anonymous mode
+        return None
+
+
 st.set_page_config(
     page_title="BIK Sanctions Screener",
     page_icon="🏦",
@@ -368,21 +382,20 @@ st.markdown(
     "and screens it against [OpenSanctions](https://www.opensanctions.org)."
 )
 
+api_key = get_api_key()
+
 with st.sidebar:
-    st.header("Settings")
-    api_key = st.text_input(
-        "OpenSanctions API key (optional)",
-        type="password",
-        help=(
-            "Anonymous access works for low traffic but is rate-limited. "
-            "Get a free key at opensanctions.org for higher quotas."
-        ),
-    )
-    st.markdown("---")
+    st.header("Pipeline")
     st.markdown(
-        "**Pipeline**\n\n"
         "1. `bik-info.ru/api.html?type=json&bik={BIK}` → bank name\n"
         "2. `api.opensanctions.org/match/sanctions` → name → sanctions hit"
+    )
+    st.markdown("---")
+    st.caption(
+        "🔑 Authenticated to OpenSanctions"
+        if api_key else
+        "🔓 Anonymous mode — set `OPENSANCTIONS_API_KEY` in Streamlit "
+        "secrets for higher rate limits"
     )
 
 bik_input = st.text_input("BIK", placeholder="e.g. 044525225", max_chars=20)
@@ -395,7 +408,7 @@ if run:
         st.stop()
 
     with st.spinner(f"Looking up BIK {bik}..."):
-        result = screen(bik, api_key=api_key or None)
+        result = screen(bik, api_key=api_key)
 
     if result["step"] == "lookup":
         st.error(f"❌ {result['error']}")
