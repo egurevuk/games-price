@@ -428,11 +428,13 @@ def bik_info_lookup(bic: str) -> dict[str, Any]:
 
 IBAN_RU_SWIFT_URL = "https://www.iban.ru/swift-bic-kodov"
 
-# Match a table row like  `| TICSRUMMXXX | 044525974 | АО "ТИНЬКОФФ БАНК |`
-# SWIFT BIC format: 4 letters (institution) + 2 letters (country) + 2 alphanumeric
-# (location) + optional 3 alphanumeric (branch). All entries here are 11-char.
-IBAN_RU_ROW_RE = re.compile(
-    r"\|\s*([A-Z]{4}[A-Z]{2}[A-Z0-9]{2}(?:[A-Z0-9]{3})?)\s*\|\s*(\d{9})\s*\|"
+# After stripping HTML tags and pipe separators, SWIFT and BIK appear as adjacent
+# whitespace-separated tokens. SWIFT BIC: 4 letters (institution) + 2 letters
+# (country) + 2 alphanumeric (location) + optional 3 alphanumeric (branch) — so
+# 8 or 11 chars. BIK: 9 digits. Word boundaries on both ends prevent false
+# matches against longer runs.
+IBAN_RU_PAIR_RE = re.compile(
+    r"\b([A-Z]{4}[A-Z]{2}[A-Z0-9]{2}(?:[A-Z0-9]{3})?)\s+(\d{9})\b"
 )
 
 
@@ -448,6 +450,11 @@ def fetch_iban_ru_swift_table() -> dict[str, str]:
     deep in the credit-org XML and not always reliable for branches. This
     table gives us a clean per-BIC SWIFT lookup with branch granularity.
 
+    Parser strategy: iban.ru serves raw HTML (`<td>SWIFT</td><td>BIK</td>...`).
+    We strip HTML tags and pipe characters first, normalize whitespace, then
+    use a single regex to find SWIFT immediately followed by BIK — same code
+    works whether the response comes back as HTML, markdown, or plain text.
+
     Cached for 24 hours in Streamlit so each screening doesn't hit iban.ru.
     """
     try:
@@ -459,8 +466,14 @@ def fetch_iban_ru_swift_table() -> dict[str, str]:
         r.raise_for_status()
     except Exception:
         return {}
+    # Strip HTML tags → space, then pipes → space, then collapse whitespace.
+    # Result is a single line of space-separated tokens where SWIFT and BIK
+    # are immediately adjacent in row order.
+    text = re.sub(r"<[^>]+>", " ", r.text)
+    text = re.sub(r"\|", " ", text)
+    text = re.sub(r"\s+", " ", text)
     table: dict[str, str] = {}
-    for m in IBAN_RU_ROW_RE.finditer(r.text):
+    for m in IBAN_RU_PAIR_RE.finditer(text):
         swift = m.group(1).upper()
         bik = m.group(2)
         # First occurrence wins (head office is usually listed before branches
