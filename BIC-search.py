@@ -157,40 +157,84 @@ def reg_number_to_internal_code(reg_number: int) -> int | None:
     return _parse_int_result(root, "RegNumToIntCodeResult")
 
 
-def resolve_bic_to_internal_code(bic: str) -> tuple[int | None, list[str]]:
-    """Two-track resolution for the internal credit-org code.
+def resolve_bic_to_internal_code(
+    bic: str,
+    *,
+    regnum_hint: str | int | None = None,
+    parent_bic_hint: str | None = None,
+) -> tuple[int | None, list[str]]:
+    """Multi-track resolution for the internal credit-org code.
 
     Track A (fast path, head-office BICs): BicToIntCode → done.
-    Track B (branch BICs, fallback): BicToRegNumber → RegNumToIntCode.
+    Track B (branch BICs, CBR fallback): BicToRegNumber → RegNumToIntCode.
+    Track C (CBR doesn't know the BIC): BicToIntCode(parent_bic_hint).
+    Track D (last resort): RegNumToIntCode(regnum_hint).
+
+    Hints come from bik-info.ru, which carries the parent bank's BIK and
+    license number for branches. These let us bridge from a branch BIC that
+    CBR can't resolve back to the parent credit org's internal code.
 
     Returns (internal_code or None, trace) where trace is a human-readable
     list of attempted steps for surfacing in the UI.
     """
     trace: list[str] = []
+
+    # Track A
     try:
         ic = bic_to_internal_code(bic)
         if ic is not None:
             trace.append(f"BicToIntCode({bic}) → {ic} ✓")
             return ic, trace
-        trace.append(f"BicToIntCode({bic}) → -1 (branch BIC or not registered)")
+        trace.append(f"BicToIntCode({bic}) → -1 (branch BIC or not a credit org primary)")
     except Exception as e:
         trace.append(f"BicToIntCode({bic}) raised: {e}")
 
+    # Track B
     try:
         rn = bic_to_reg_number(bic)
-        if rn is None:
-            trace.append(f"BicToRegNumber({bic}) → not found")
-            return None, trace
-        trace.append(f"BicToRegNumber({bic}) → reg №{rn}")
-        ic = reg_number_to_internal_code(rn)
-        if ic is None:
+        if rn is not None:
+            trace.append(f"BicToRegNumber({bic}) → reg №{rn}")
+            ic = reg_number_to_internal_code(rn)
+            if ic is not None:
+                trace.append(f"RegNumToIntCode({rn}) → {ic} ✓")
+                return ic, trace
             trace.append(f"RegNumToIntCode({rn}) → not found")
-            return None, trace
-        trace.append(f"RegNumToIntCode({rn}) → {ic} ✓ (resolved via parent credit org)")
-        return ic, trace
+        else:
+            trace.append(f"BicToRegNumber({bic}) → not found")
     except Exception as e:
-        trace.append(f"Fallback chain raised: {e}")
-        return None, trace
+        trace.append(f"BicToRegNumber chain raised: {e}")
+
+    # Track C: parent BIK from bik-info.ru
+    if parent_bic_hint and parent_bic_hint != bic:
+        try:
+            ic = bic_to_internal_code(parent_bic_hint)
+            if ic is not None:
+                trace.append(
+                    f"BicToIntCode({parent_bic_hint}) [parent_bik from bik-info.ru] → {ic} ✓"
+                )
+                return ic, trace
+            trace.append(f"BicToIntCode({parent_bic_hint}) [parent_bik] → -1")
+        except Exception as e:
+            trace.append(f"Parent BIK resolution raised: {e}")
+
+    # Track D: regnum from bik-info.ru
+    if regnum_hint:
+        try:
+            rn = int(str(regnum_hint).strip()) if str(regnum_hint).strip().isdigit() else None
+            if rn:
+                ic = reg_number_to_internal_code(rn)
+                if ic is not None:
+                    trace.append(
+                        f"RegNumToIntCode({rn}) [regnum from bik-info.ru] → {ic} ✓"
+                    )
+                    return ic, trace
+                trace.append(f"RegNumToIntCode({rn}) [from bik-info.ru] → not found")
+            else:
+                trace.append(f"regnum hint {regnum_hint!r} is not a positive integer")
+        except Exception as e:
+            trace.append(f"RegNum hint resolution raised: {e}")
+
+    return None, trace
 
 
 def internal_code_to_credit_info(int_code: int) -> ET.Element | None:
@@ -281,13 +325,21 @@ def extract_all_values(credit_info: ET.Element, *attr_names: str) -> list[str]:
     return seen
 
 
-def cbr_lookup(bic: str) -> dict[str, Any]:
+def cbr_lookup(
+    bic: str,
+    *,
+    regnum_hint: str | int | None = None,
+    parent_bic_hint: str | None = None,
+) -> dict[str, Any]:
     """Full Step-1 chain. Returns {internal_code, swift_codes, names, ...} or {error}.
 
-    Uses the two-track resolver: tries BicToIntCode first, falls back to
-    BicToRegNumber → RegNumToIntCode for branch BICs.
+    Uses the multi-track resolver: tries BicToIntCode first, falls back to
+    BicToRegNumber → RegNumToIntCode for branch BICs, and finally uses hints
+    from bik-info.ru (parent BIK, parent regnum) when CBR alone fails.
     """
-    int_code, trace = resolve_bic_to_internal_code(bic)
+    int_code, trace = resolve_bic_to_internal_code(
+        bic, regnum_hint=regnum_hint, parent_bic_hint=parent_bic_hint
+    )
     if int_code is None:
         return {
             "error": f"BIC {bic} not resolvable via CBR",
@@ -542,9 +594,28 @@ if not bic:
 
 st.markdown(f"### Screening BIC `{bic}`")
 
+# Pre-fetch bik-info.ru silently so its data can be used as fallback hints
+# for CBR resolution (parent BIK and parent regnum unlock branch-BIC cases).
+with st.spinner("Looking up bank reference data…"):
+    bi_pre = bik_info_lookup(bic)
+
+# Extract hints — try multiple field names since bik-info.ru is loose with casing
+def _bi_get(*keys: str) -> str | None:
+    if not isinstance(bi_pre, dict):
+        return None
+    for k in keys:
+        v = bi_pre.get(k)
+        if v and str(v).strip() and str(v).strip().lower() != "null":
+            return str(v).strip()
+    return None
+
+regnum_hint = _bi_get("regnum", "RegN", "regNumber", "registration_number")
+parent_bic_hint = _bi_get("bik_p", "parent_bik", "parentBik", "bikP")
+inn_hint = _bi_get("inn", "INN", "innCode", "inn_code")
+
 # ─── STEP 1 ──────────────────────────────────────────────────────────────────
 with st.status("Step 1 · CBR: resolve BIC → internal code → SWIFT", expanded=True) as status:
-    cbr = cbr_lookup(bic)
+    cbr = cbr_lookup(bic, regnum_hint=regnum_hint, parent_bic_hint=parent_bic_hint)
 
     # Always show how we tried to resolve the BIC (helps diagnose -1 / branch BICs)
     trace = cbr.get("resolution_trace") or []
@@ -592,11 +663,10 @@ with st.status("Step 1 · CBR: resolve BIC → internal code → SWIFT", expande
 
 # ─── STEP 2 ──────────────────────────────────────────────────────────────────
 with st.status("Step 2 · bik-info.ru: bank name & address + transliteration", expanded=True) as status:
-    bi = bik_info_lookup(bic)
-    if bi.get("error"):
+    bi = bi_pre  # reuse pre-fetched data
+    if isinstance(bi, dict) and bi.get("error"):
         st.error(bi["error"])
         status.update(label=f"Step 2 · {bi['error']}", state="error")
-        # don't stop — we may still screen on what we have from Step 1
         bi = {}
 
     cbr_short = (cbr.get("short_names_cbr") or [None])[0]
@@ -606,8 +676,9 @@ with st.status("Step 2 · bik-info.ru: bank name & address + transliteration", e
     name_ru = bi.get("name") or bi.get("namemini") or cbr_short or ""
     short_name_ru = bi.get("namemini") or ""
     address_ru = bi.get("address") or cbr_addr_primary or ""
-    inn = bi.get("inn")
-    kpp = bi.get("kpp")
+    # Try multiple case/snake-case variants for INN since bik-info.ru is inconsistent
+    inn = inn_hint or bi.get("inn") or bi.get("INN")
+    kpp = bi.get("kpp") or bi.get("KPP")
     ks = bi.get("ks")
     phone = bi.get("phone")
 
@@ -647,6 +718,10 @@ with st.status("Step 2 · bik-info.ru: bank name & address + transliteration", e
                 "CBR internal code": cbr.get("internal_code"),
             }
         )
+
+    with st.expander("Raw bik-info.ru response (debug)"):
+        st.json(bi or {"(no response)": None})
+
     status.update(label="Step 2 · Bank identified", state="complete")
 
 # ─── STEP 3 ──────────────────────────────────────────────────────────────────
