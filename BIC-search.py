@@ -16,6 +16,7 @@ import re
 import json
 import time
 from datetime import datetime
+from html import unescape
 from typing import Any
 
 import pandas as pd
@@ -166,6 +167,133 @@ def lookup_bank_in_cbr_registry(bik: str, api_key: str) -> dict | None:
         # else: every result for this query failed strict validation → try next
 
     return None
+
+
+# ---------------------------------------------------------------------------
+# External CBR directory fallback (bankirsha.com)
+# ---------------------------------------------------------------------------
+#
+# OpenSanctions indexes a `ru-bik-{BIK}` identifier on the parent legal entity
+# for each *head-office* BIK that appears on a sanctions list (Sberbank,
+# VTB, Alfa-Bank, Tinkoff/T-Bank, etc.). It does NOT index branch BIKs of
+# those banks — e.g. 044030653 (Sberbank's Severo-Zapadny territorial
+# branch) and 044525411 (VTB's Tsentralny Moscow branch) have no entity in
+# OpenSanctions even though their parent legal entity is heavily
+# sanctioned.
+#
+# To screen those correctly we need a complete BIK directory. bankirsha.com
+# mirrors the CBR's BIK register and explicitly lists, for every branch
+# BIK, the parent's head-office BIK. We scrape that page and, if a head
+# office BIK is found, do a second OpenSanctions lookup against it.
+
+DIRECTORY_URL = "https://bankirsha.com/bik.{bik}.html"
+DIRECTORY_UA = "Mozilla/5.0 (BIK-Screener; +github.com/anthropics/claude-code)"
+
+
+@st.cache_data(show_spinner=False, ttl=86400)  # cache a full day
+def resolve_bik_via_directory(bik: str) -> dict | None:
+    """Fetch BIK metadata from the bankirsha.com CBR directory mirror.
+
+    Returns a dict like::
+
+        {
+            "bik": "044030653",
+            "name":          "СЕВЕРО-ЗАПАДНЫЙ БАНК ПАО СБЕРБ",
+            "fullName":      "СЕВЕРО-ЗАПАДНЫЙ БАНК ПАО СБЕРБАНК",
+            "type":          "Территориальные управления Сбербанка (ТУСБ)",
+            "swift":         "SABRRU2PXXX",
+            "regNumber":     "1481/1309",
+            "address":       "191124, САНКТ-ПЕТЕРБУРГ, УЛ КРАСНОГО ТЕКСТИЛЬЩИКА, 2",
+            "headOfficeBik": "044525225",      # only present for branches
+            "_source":       "bankirsha.com",
+        }
+
+    or ``None`` if the page can't be reached or doesn't contain valid data.
+    Parsing is regex-based against the page's stable two-column table; if
+    bankirsha.com ever restructures the page we just fall back to "unknown".
+    """
+    url = DIRECTORY_URL.format(bik=bik)
+    try:
+        resp = requests.get(
+            url,
+            timeout=15,
+            headers={"User-Agent": DIRECTORY_UA, "Accept-Language": "ru,en"},
+        )
+        resp.raise_for_status()
+    except requests.RequestException:
+        return None
+
+    html = resp.text
+    # Safety: the page must contain the BIK we asked for
+    if bik not in html:
+        return None
+
+    def _grab(pattern: str) -> str | None:
+        m = re.search(pattern, html, re.DOTALL | re.IGNORECASE)
+        return unescape(m.group(1)).strip() if m else None
+
+    info: dict[str, str | None] = {"bik": bik, "_source": "bankirsha.com"}
+
+    # Standard table fields. The page uses <td>Label</td><td>Value</td>.
+    # Values sometimes wrap in <a>/<span> — strip inner tags afterwards.
+    raw_fields = {
+        "name":      r"Наименование банка\s*</td>\s*<td[^>]*>(.+?)</td>",
+        "fullName":  r"Полное название\s*</td>\s*<td[^>]*>(.+?)</td>",
+        "type":      r"Тип организации\s*</td>\s*<td[^>]*>(.+?)</td>",
+        "regNumber": r"Регистрационный номер[^<]*</td>\s*<td[^>]*>(.+?)</td>",
+        "swift":     r"SWIFT[^<]*\)\s*</td>\s*<td[^>]*>(.+?)</td>",
+        "address":   r"Юридический адрес\s*</td>\s*<td[^>]*>(.+?)</td>",
+    }
+    for key, pat in raw_fields.items():
+        raw = _grab(pat)
+        if raw:
+            # Strip nested HTML tags from the captured cell
+            info[key] = re.sub(r"<[^>]+>", "", raw).strip() or None
+
+    # Head office BIK (only present for branch/division entries).
+    # The "Головной офис" section links to the parent's BIK page.
+    head_match = re.search(
+        r"Головной офис[\s\S]{0,600}?bik\.(\d{9})\.html", html
+    )
+    if head_match and head_match.group(1) != bik:
+        info["headOfficeBik"] = head_match.group(1)
+
+    if not (info.get("fullName") or info.get("name")):
+        return None
+    return info
+
+
+def _synthetic_entity_from_directory(bik: str, info: dict) -> dict:
+    """Build an OpenSanctions-shaped entity from directory data.
+
+    Used when the BIK exists in the CBR directory but neither it nor its
+    head office is indexed by OpenSanctions. The synthetic entity feeds
+    /match/sanctions, which can still find the parent legal entity via
+    name + SWIFT BIC fuzzy matching.
+    """
+    name = info.get("fullName") or info.get("name") or f"Bank with BIK {bik}"
+    props: dict[str, list[str]] = {
+        "name": [name],
+        "jurisdiction": ["Russia"],
+        "country": ["ru"],
+        "registrationNumber": [bik],
+    }
+    if info.get("swift"):
+        # Strip optional 3-char branch suffix (e.g. SABRRU2PXXX → SABRRU2P)
+        sw = re.sub(r"X{1,3}$", "", info["swift"])
+        props["swiftBic"] = [sw] if sw else [info["swift"]]
+    if info.get("address"):
+        props["address"] = [info["address"]]
+    return {
+        "id": None,
+        "schema": "Company",
+        "properties": props,
+        "referents": [f"ru-bik-{bik}"],
+        "datasets": [],
+        "target": False,
+        "_synthetic": True,
+        "_source": info.get("_source"),
+    }
 
 
 @st.cache_data(show_spinner=False, ttl=3600)
@@ -386,6 +514,7 @@ def render_bank_card(bank: dict) -> None:
     status = first(props, "status")
     incorp = first(props, "incorporationDate")
     aliases = props.get("alias") or []
+    swift = first(props, "swiftBic")
 
     st.markdown(f"### {name}")
     cols = st.columns([1, 1, 1])
@@ -398,9 +527,24 @@ def render_bank_card(bank: dict) -> None:
             st.write(f"**Address:** {address}")
         if incorp != "—":
             st.write(f"**Incorporated:** {incorp}")
+        if swift != "—":
+            st.write(f"**SWIFT/BIC:** `{swift}`")
         if aliases:
             st.write("**Aliases:** " + " · ".join(aliases[:10]))
-        st.write(f"**OpenSanctions entity:** [`{bank.get('id')}`](https://www.opensanctions.org/entities/{bank.get('id')}/)")
+        eid = bank.get("id")
+        if eid:
+            st.write(
+                f"**OpenSanctions entity:** "
+                f"[`{eid}`](https://www.opensanctions.org/entities/{eid}/)"
+            )
+        if bank.get("_synthetic"):
+            st.info(
+                "ℹ️ This bank isn't directly indexed by OpenSanctions — "
+                "its identity was derived from "
+                f"`{bank.get('_source', 'external directory')}` and the "
+                "sanctions check below was performed by fuzzy match on "
+                "name + SWIFT against OpenSanctions' /match endpoint."
+            )
 
 
 # Map from OpenSanctions referent prefixes to the issuing authority. Each
@@ -614,7 +758,21 @@ def render_match_table(top_hits: list[dict]) -> None:
 # ---------------------------------------------------------------------------
 
 def screen_bik(bik_raw: str, api_key: str, scope: str) -> dict:
-    """Run the full pipeline for a single BIK and return a result dict."""
+    """Run the full pipeline for a single BIK and return a result dict.
+
+    Resolution strategy:
+      1. Strict OpenSanctions index lookup (covers head-office BIKs of
+         sanctioned banks, e.g. 044525974 → Tinkoff).
+      2. If miss → fetch BIK metadata from the external CBR directory
+         (bankirsha.com). If it's a branch BIK with a head-office BIK
+         pointer (e.g. 044030653 → 044525225), re-query OpenSanctions
+         against the head office. That's the common case for branches of
+         sanctioned banks (Sberbank, VTB, etc.).
+      3. If even the head office isn't indexed → build a synthetic entity
+         from the directory data and let /match find the parent legal
+         entity by fuzzy name + SWIFT BIC.
+      4. If the BIK isn't in the CBR directory at all → unknown.
+    """
     bik = normalize_bik(bik_raw)
     result: dict[str, Any] = {
         "bik_input": bik_raw,
@@ -624,36 +782,68 @@ def screen_bik(bik_raw: str, api_key: str, scope: str) -> dict:
         "match": None,
         "verdict": None,
         "error": None,
+        "resolved_via": None,
+        "directory_info": None,
     }
     if not is_valid_bik(bik):
         result["status"] = "error"
         result["error"] = "BIK must be 8 or 9 digits."
         return result
 
+    # ---- Stage 1: strict OpenSanctions index lookup -----------------------
     try:
         bank = lookup_bank_in_cbr_registry(bik, api_key)
     except requests.HTTPError as exc:
-        result["error"] = f"CBR lookup failed: {exc.response.status_code} {exc.response.text[:200]}"
+        result["error"] = f"OpenSanctions lookup failed: {exc.response.status_code} {exc.response.text[:200]}"
         return result
     except Exception as exc:
-        result["error"] = f"CBR lookup failed: {exc}"
+        result["error"] = f"OpenSanctions lookup failed: {exc}"
         return result
+
+    if bank:
+        result["resolved_via"] = "OpenSanctions index (direct BIK match)"
+
+    # ---- Stage 2: external CBR directory fallback for branch BIKs --------
+    if not bank:
+        info = resolve_bik_via_directory(bik)
+        if info:
+            result["directory_info"] = info
+            # 2a. Branch with a head-office BIK pointer → re-query OpenSanctions
+            head_bik = info.get("headOfficeBik")
+            if head_bik:
+                try:
+                    head_bank = lookup_bank_in_cbr_registry(head_bik, api_key)
+                except Exception:
+                    head_bank = None
+                if head_bank:
+                    bank = head_bank
+                    result["resolved_via"] = (
+                        f"CBR directory → head-office BIK {head_bik} "
+                        f"(branch \"{info.get('fullName') or info.get('name')}\" "
+                        f"of this legal entity)"
+                    )
+            # 2b. Otherwise build a synthetic entity from the directory data
+            if not bank:
+                bank = _synthetic_entity_from_directory(bik, info)
+                result["resolved_via"] = (
+                    "CBR directory (not indexed by OpenSanctions; "
+                    "/match performed by name + SWIFT)"
+                )
 
     if not bank:
         result["status"] = "unknown"
         result["error"] = (
-            "No OpenSanctions entity carries this BIK as an identifier.\n\n"
-            "Possible reasons:\n"
-            "• The BIK is invalid or a typo.\n"
+            "Couldn't resolve this BIK. Possible reasons:\n\n"
+            "• The BIK is invalid or a typo (must be 9 digits starting with 04).\n"
             "• The bank's licence was recently revoked and the entry was "
-            "dropped from the CBR feed.\n"
-            "• The BIK is too new to be in the OpenSanctions snapshot "
-            "(the dataset refreshes daily).\n"
-            "• OpenSanctions doesn't index this particular branch BIK.\n\n"
-            "Cross-check the BIK on opensanctions.org directly, and on the "
-            "CBR's own registry (cbr.ru) before acting on this result."
+            "dropped from both OpenSanctions and the external CBR directory.\n"
+            "• The directory mirror (bankirsha.com) is temporarily "
+            "unreachable from your network.\n\n"
+            "Cross-check the BIK on opensanctions.org and on the CBR's own "
+            "registry (cbr.ru) before acting on this result."
         )
         return result
+
     result["bank"] = bank
 
     # Pull the fully-hydrated entity (includes datasets + sanction relationships)
@@ -772,23 +962,33 @@ with tab_single:
     with col_btn:
         run = st.button("Screen", type="primary", use_container_width=True)
 
-    # Sample chips for convenience
+    # Sample chips for convenience — verified against opensanctions.org
     st.caption("Try a sample BIK:")
-    sample_cols = st.columns(5)
     samples = [
-        ("040813713", "sanctioned"),
-        ("044030653", "sanctioned"),
+        ("044525974", "sanctioned"),  # Tinkoff — direct hit in OpenSanctions
+        ("044030653", "sanctioned"),  # Sberbank Severo-Zapadny branch — via head office
+        ("044525411", "sanctioned"),  # VTB Tsentralny branch — via head office
+        ("044525593", "sanctioned"),  # Alfa-Bank — direct
+        ("044525104", "sanctioned"),  # Bank Tochka — direct
+        ("044525700", "clear"),
         ("046577904", "clear"),
         ("046015762", "clear"),
-        ("044525700", "clear"),
+        ("040349556", "clear"),
     ]
-    for col, (s, label) in zip(sample_cols, samples):
-        with col:
-            icon = "❌" if label == "sanctioned" else "✅"
-            if st.button(f"{icon} {s}", key=f"sample_{s}", use_container_width=True,
-                         help=f"expected: {label}"):
-                st.session_state["_prefill"] = s
-                st.rerun()
+    # Layout in two rows: sanctioned on top, clear below
+    sanctioned = [s for s in samples if s[1] == "sanctioned"]
+    clear = [s for s in samples if s[1] == "clear"]
+    for row, label in [(sanctioned, "Expected SANCTIONED"), (clear, "Expected CLEAR")]:
+        st.caption(label)
+        cols = st.columns(len(row))
+        for col, (s, lab) in zip(cols, row):
+            with col:
+                icon = "❌" if lab == "sanctioned" else "✅"
+                if st.button(f"{icon} {s}", key=f"sample_{s}",
+                             use_container_width=True,
+                             help=f"expected: {lab}"):
+                    st.session_state["_prefill"] = s
+                    st.rerun()
 
     if "_prefill" in st.session_state and not bik_input:
         bik_input = st.session_state.pop("_prefill")
@@ -813,6 +1013,8 @@ with tab_single:
             with top[0]:
                 render_status_badge(res["status"])
                 st.write(f"**BIK:** `{res['bik']}`")
+                if res.get("resolved_via"):
+                    st.caption(f"🔍 Resolved via: {res['resolved_via']}")
             with top[1]:
                 if res["status"] == "error":
                     st.error(res["error"])
