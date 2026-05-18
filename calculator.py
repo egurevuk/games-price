@@ -64,6 +64,32 @@ def os_headers(api_key: str | None) -> dict:
     return {}
 
 
+def get_api_key() -> str:
+    """Return the OpenSanctions API key.
+
+    Resolution order:
+      1. ``st.secrets["OPENSANCTIONS_API_KEY"]`` — recommended.
+         Stored in ``.streamlit/secrets.toml`` locally, or in the Streamlit
+         Cloud "Secrets" panel in deployment. Never committed to git.
+      2. ``OPENSANCTIONS_API_KEY`` environment variable — useful for
+         Docker / CI / quick local runs.
+
+    Returns an empty string if neither is set, so the caller can show a
+    friendly message rather than crash.
+    """
+    # 1. Streamlit secrets. Accessing st.secrets when no secrets.toml exists
+    #    raises StreamlitSecretNotFoundError; accessing a missing key raises
+    #    KeyError. Both are non-fatal — we fall through to the env var.
+    try:
+        val = st.secrets.get("OPENSANCTIONS_API_KEY", "")
+        if val:
+            return str(val).strip()
+    except Exception:
+        pass
+    # 2. Environment variable
+    return os.environ.get("OPENSANCTIONS_API_KEY", "").strip()
+
+
 # ---------------------------------------------------------------------------
 # OpenSanctions API calls
 # ---------------------------------------------------------------------------
@@ -434,14 +460,41 @@ st.caption(
 )
 
 # --- Sidebar config -------------------------------------------------------
+api_key = get_api_key()
+
 with st.sidebar:
     st.header("Configuration")
-    api_key = st.text_input(
-        "OpenSanctions API key",
-        value=os.environ.get("OPENSANCTIONS_API_KEY", ""),
-        type="password",
-        help="Get a free key at https://www.opensanctions.org/account/",
-    )
+
+    # API key status (no input — the key lives in st.secrets / env)
+    if api_key:
+        st.success("OpenSanctions API key loaded ✓", icon="🔑")
+        with st.expander("Where is the key loaded from?"):
+            try:
+                in_secrets = bool(st.secrets.get("OPENSANCTIONS_API_KEY"))
+            except Exception:
+                in_secrets = False
+            in_env = bool(os.environ.get("OPENSANCTIONS_API_KEY"))
+            st.markdown(
+                f"* `st.secrets`: {'✅ set' if in_secrets else '— not set'}\n"
+                f"* `OPENSANCTIONS_API_KEY` env var: {'✅ set' if in_env else '— not set'}"
+            )
+    else:
+        st.error("OpenSanctions API key not configured", icon="🔒")
+        with st.expander("How to add the key", expanded=True):
+            st.markdown(
+                "Create **`.streamlit/secrets.toml`** in the project root:\n\n"
+                "```toml\n"
+                'OPENSANCTIONS_API_KEY = "your_key_here"\n'
+                "```\n\n"
+                "…or export it as an env var before launching Streamlit:\n\n"
+                "```bash\n"
+                'export OPENSANCTIONS_API_KEY="your_key_here"\n'
+                "streamlit run app.py\n"
+                "```\n\n"
+                "Get a free key at "
+                "[opensanctions.org/account](https://www.opensanctions.org/account/)."
+            )
+
     scope = st.radio(
         "Screening scope",
         options=[SANCTIONS_SCOPE, DEFAULT_SCOPE],
@@ -506,8 +559,10 @@ with tab_single:
     if run:
         if not api_key:
             st.warning(
-                "Please paste an OpenSanctions API key in the sidebar. "
-                "You can get a free one at https://www.opensanctions.org/account/"
+                "OpenSanctions API key is not configured. Add it to "
+                "`.streamlit/secrets.toml` as "
+                "`OPENSANCTIONS_API_KEY = \"...\"` (see sidebar) and reload.",
+                icon="🔒",
             )
         elif not bik_input.strip():
             st.warning("Please enter a BIK.")
@@ -562,7 +617,11 @@ with tab_batch:
 
     if run_batch:
         if not api_key:
-            st.warning("Please paste an OpenSanctions API key in the sidebar.")
+            st.warning(
+                "OpenSanctions API key is not configured. Add it to "
+                "`.streamlit/secrets.toml` and reload.",
+                icon="🔒",
+            )
         else:
             raw_biks = re.split(r"[\s,;]+", bulk.strip())
             biks = [b for b in (normalize_bik(x) for x in raw_biks) if b]
