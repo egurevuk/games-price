@@ -539,13 +539,14 @@ def _has_sanction_signal(candidate: dict) -> bool:
 
 # Score thresholds for the verdict ladder. logic-v2 returns scores in
 # [0, 1]; the `match` flag is set when score clears its internal
-# threshold (≈ 0.7). We're more lenient because cross-script names rarely
-# clear it cleanly:
-#   ≥ 0.70 → strong match (high confidence)
-#   ≥ 0.50 → possible match (review-worthy)
-#   <  0.50 → too weak to call
+# threshold (≈ 0.7). We use a generous review band because cross-script
+# names rarely clear it cleanly — better to surface borderline hits for
+# human review than silently dismiss them:
+#   ≥ 0.70 → strong match (SANCTIONED — high confidence)
+#   ≥ 0.20 → possible match (REVIEW — verify on OpenSanctions)
+#   <  0.20 → too weak to call
 MATCH_STRONG = 0.70
-MATCH_POSSIBLE = 0.50
+MATCH_POSSIBLE = 0.20
 
 
 def _pick_best_candidate(results: list[dict]) -> dict | None:
@@ -732,6 +733,11 @@ if run:
         sanctioned = is_sanctioned(target_entity)
         score = candidate.get("score", 0.0)
         matched_via = result.get("matched_via")
+        entity_id = target_entity.get("id") or candidate.get("id")
+        os_url = (
+            f"https://www.opensanctions.org/entities/{entity_id}/"
+            if entity_id else None
+        )
 
         # Exact bikCode hit on a sanctioned entity → definitive SANCTIONED
         # regardless of name-match score.
@@ -757,18 +763,27 @@ if run:
             st.markdown(
                 '<div style="background:#f59e0b;color:white;padding:12px 16px;'
                 'border-radius:8px;font-weight:600;font-size:1.1rem;'
-                'display:inline-block;">⚠️ LIKELY SANCTIONED — REVIEW</div>',
+                'display:inline-block;">⚠️ REVIEW NEEDED</div>',
                 unsafe_allow_html=True,
             )
-            st.caption(
-                "A sanctioned entity matched this bank by fuzzy name. "
-                "The BIK isn't directly listed on the sanctioned entity — "
-                "this is the typical pattern for branch BIKs whose parent "
-                "is the sanctioned legal entity."
+            st.markdown(
+                f"A sanctioned entity matched **{bank_name}** with a "
+                f"**{score:.0%}** name similarity. Please verify the "
+                f"match below before treating this bank as sanctioned."
             )
+            if os_url:
+                st.markdown(
+                    f'<a href="{os_url}" target="_blank" '
+                    f'style="display:inline-block;background:#2563eb;'
+                    f'color:white;padding:10px 16px;border-radius:6px;'
+                    f'text-decoration:none;font-weight:600;margin-top:8px;">'
+                    f'🔍 Check the match on OpenSanctions ↗</a>',
+                    unsafe_allow_html=True,
+                )
         else:
             st.success("✅ **CLEAR** — best match isn't on a sanctions list")
 
+        st.markdown("")  # spacer
         st.markdown(f"**Bank (from bik-info.ru):** {bank_name}")
         st.markdown(
             f"**Matched OpenSanctions entity:** "
@@ -782,7 +797,7 @@ if run:
         elif matched_via == "name":
             st.caption(
                 f"Resolved via fuzzy name match (cross-script) · "
-                f"score: {score:.2f}"
+                f"score: {score:.2f}  ({score:.0%})"
             )
 
         if sanctioned and (matched_via == "bikCode" or score >= MATCH_POSSIBLE):
@@ -792,12 +807,10 @@ if run:
                 for c in countries:
                     st.markdown(f"- {c}")
 
-        entity_id = target_entity.get("id") or candidate.get("id")
-        if entity_id:
-            os_url = f"https://www.opensanctions.org/entities/{entity_id}/"
+        if os_url:
             st.markdown(
-                f"### Full record\n"
-                f"[Open on OpenSanctions ↗]({os_url})"
+                f"### Full OpenSanctions record\n"
+                f"[Open canonical entity page ↗]({os_url})"
             )
 
     # --- Diagnostic details -------------------------------------------------
