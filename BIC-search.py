@@ -109,23 +109,23 @@ def lookup_bik(bik: str) -> dict[str, Any]:
         )
         resp.raise_for_status()
     except requests.RequestException as exc:
-        return {"ok": False, "name": None, "raw": None,
+        return {"ok": False, "name": None, "swift": None, "raw": None,
                 "error": f"bik-info.ru request failed: {exc}"}
 
     try:
         data = resp.json()
     except ValueError:
-        return {"ok": False, "name": None, "raw": None,
+        return {"ok": False, "name": None, "swift": None, "raw": None,
                 "error": "bik-info.ru returned non-JSON"}
 
     if not isinstance(data, dict):
-        return {"ok": False, "name": None, "raw": None,
+        return {"ok": False, "name": None, "swift": None, "raw": None,
                 "error": "bik-info.ru returned an unexpected shape"}
 
     # API returns {"error": "BIK not found"} when the BIK isn't in the
     # registry. Otherwise it returns the bank record as a flat dict.
     if "error" in data and len(data) <= 2:
-        return {"ok": False, "name": None, "raw": data,
+        return {"ok": False, "name": None, "swift": None, "raw": data,
                 "error": str(data.get("error", "BIK not found"))}
 
     # The API uses Russian-ish field names; we accept whichever turns up.
@@ -137,10 +137,20 @@ def lookup_bik(bik: str) -> dict[str, Any]:
         or data.get("name_bank")
     )
     if not name:
-        return {"ok": False, "name": None, "raw": data,
+        return {"ok": False, "name": None, "swift": None, "raw": data,
                 "error": "Couldn't find a bank name in the response"}
 
-    return {"ok": True, "name": str(name).strip(), "raw": data, "error": None}
+    swift = (
+        data.get("swift")
+        or data.get("swiftbic")
+        or data.get("swift_code")
+        or data.get("bic")
+        or data.get("code_swift")
+    )
+    swift = str(swift).strip().upper() if swift else None
+
+    return {"ok": True, "name": str(name).strip(), "swift": swift,
+            "raw": data, "error": None}
 
 
 # ---------------------------------------------------------------------------
@@ -348,6 +358,75 @@ def search_opensanctions_by_bik_code(
 
 
 @st.cache_data(show_spinner=False, ttl=3600)
+def search_opensanctions_by_swift_bic(
+    swift: str, api_key: str | None = None
+) -> dict[str, Any]:
+    """Search OpenSanctions by SWIFT/BIC via the ``swiftBic`` Organization
+    property.
+
+    SWIFT codes are structured ``AAAA-BB-CC[-XXX]``: the first 4 chars
+    are the bank identifier, next 2 the country, next 2 the location,
+    last 3 the optional branch suffix. When we send the full SWIFT to
+    ``/match``, logic-v2 scores candidates against the ``swiftBic`` field
+    — exact matches score 1.0; matches sharing only the bank+country
+    prefix (e.g. SABRRU2P vs SABRRUMM, both Sberbank but different
+    regional offices) typically score around 0.6–0.8.
+
+    We pass the 8-char primary-office form (branch suffix stripped, if
+    present) so codes like ``TICSRUMMXXX`` and ``TICSRUMM`` compare
+    equal.
+    """
+    if not swift:
+        return {"ok": True, "error": None, "results": [], "swift_query": None}
+
+    # Strip optional branch suffix (XXX or X-padded)
+    normalized = re.sub(r"X{1,3}$", "", swift.upper().strip())
+    if not normalized:
+        return {"ok": True, "error": None, "results": [], "swift_query": None}
+
+    headers = {"Content-Type": "application/json"}
+    if api_key:
+        headers["Authorization"] = f"ApiKey {api_key}"
+
+    payload = {
+        "queries": {
+            "q1": {
+                "schema": "Organization",
+                "properties": {
+                    "swiftBic": [normalized],
+                    "country":  ["ru"],
+                },
+            }
+        }
+    }
+    try:
+        resp = requests.post(
+            f"{OPENSANCTIONS_API}/match/sanctions",
+            json=payload,
+            headers=headers,
+            timeout=30,
+        )
+        resp.raise_for_status()
+    except requests.RequestException as exc:
+        return {"ok": False, "error": f"OpenSanctions swiftBic lookup failed: {exc}",
+                "results": [], "swift_query": normalized}
+
+    try:
+        data = resp.json()
+    except ValueError:
+        return {"ok": False, "error": "OpenSanctions returned non-JSON",
+                "results": [], "swift_query": normalized}
+
+    results = (
+        data.get("responses", {})
+        .get("q1", {})
+        .get("results", [])
+    ) or []
+    return {"ok": True, "error": None, "results": results,
+            "swift_query": normalized}
+
+
+@st.cache_data(show_spinner=False, ttl=3600)
 def search_opensanctions_by_name(
     name: str, api_key: str | None = None
 ) -> dict[str, Any]:
@@ -543,10 +622,16 @@ def _has_sanction_signal(candidate: dict) -> bool:
 # names rarely clear it cleanly — better to surface borderline hits for
 # human review than silently dismiss them:
 #   ≥ 0.70 → strong match (SANCTIONED — high confidence)
-#   ≥ 0.20 → possible match (REVIEW — verify on OpenSanctions)
+#   ≥ 0.20 → possible name match (REVIEW — verify on OpenSanctions)
 #   <  0.20 → too weak to call
 MATCH_STRONG = 0.70
 MATCH_POSSIBLE = 0.20
+# SWIFT codes are structured identifiers, so even a partial match
+# (e.g. same bank prefix, different regional office) is signal:
+#   ≥ 0.95 → exact (or near-exact) SWIFT → SANCTIONED
+#   ≥ 0.50 → significant SWIFT overlap (same bank family) → REVIEW
+SWIFT_MATCH_STRONG = 0.95
+SWIFT_MATCH_REVIEW = 0.50
 
 
 def _pick_best_candidate(results: list[dict]) -> dict | None:
@@ -574,57 +659,108 @@ def _pick_best_candidate(results: list[dict]) -> dict | None:
     return max(results, key=lambda r: r.get("score", 0))
 
 
+def _pick_best_swift_candidate(results: list[dict]) -> dict | None:
+    """Like ``_pick_best_candidate`` but using ``SWIFT_MATCH_REVIEW`` (0.50)
+    as the floor, because SWIFT prefix-matching is more meaningful than
+    cross-script name fuzziness."""
+    if not results:
+        return None
+    sanctioned = [r for r in results
+                  if _has_sanction_signal(r)
+                  and r.get("score", 0) >= SWIFT_MATCH_REVIEW]
+    sanctioned.sort(key=lambda r: r.get("score", 0), reverse=True)
+    return sanctioned[0] if sanctioned else None
+
+
 def screen(bik: str, api_key: str | None) -> dict[str, Any]:
     """Full pipeline.
 
-    1. ``bik-info.ru`` → bank name (always done; used for display).
-    2. ``OpenSanctions /match`` with ``bikCode`` property = an EXACT
-       identifier match. Russian banks indexed in OpenSanctions store the
-       BIK as a Company property, so this hits the canonical sanctioned
-       entity directly when one exists.
-    3. **Fallback** — if step 2 returns no usable hit (common for branch
-       BIKs whose parent legal entity stores only its own head-office
-       BIK), fall through to name-based fuzzy search with transliteration
-       and variant expansion.
+    1. ``bik-info.ru`` → bank name + SWIFT (for display + downstream matching).
+    2. ``OpenSanctions /match`` by ``bikCode`` property — exact ID match.
+    3. ``OpenSanctions /match`` by ``swiftBic`` property — exact or
+       prefix match against the SWIFT/BIC from step 1.
+    4. ``OpenSanctions /match`` by name — Cyrillic→Latin transliteration
+       and multi-variant fuzzy search.
+
+    The strongest signal wins:
+    * Exact bikCode hit on a sanctioned entity → ❌ SANCTIONED
+    * SWIFT match ≥ 0.95 on sanctioned → ❌ SANCTIONED
+    * SWIFT match ≥ 0.50 on sanctioned → ⚠️ REVIEW (verify on OpenSanctions)
+    * Name match ≥ 0.70 on sanctioned → ❌ SANCTIONED
+    * Name match ≥ 0.20 on sanctioned → ⚠️ REVIEW
+    * Otherwise → ✅ CLEAR
     """
     info = lookup_bik(bik)
     if not info["ok"]:
         return {"step": "lookup", "bik": bik, **info}
 
     name = info["name"]
+    swift = info.get("swift")
 
     # ---- Step 2: exact-identifier search via bikCode property ---------
     bik_match = search_opensanctions_by_bik_code(bik, api_key=api_key)
     bik_results = bik_match.get("results") or []
     bik_candidate = _pick_best_candidate(bik_results) if bik_results else None
 
-    matched_via = None
-    candidate = None
-    results: list[dict] = []
-    variants_used: list[str] = []
-
     if bik_candidate and _has_sanction_signal(bik_candidate):
         # Exact BIK match against a sanctioned entity — definitive.
+        enriched = (
+            fetch_full_entity(bik_candidate["id"], api_key=api_key)
+            if bik_candidate.get("id") else None
+        )
+        return {
+            "step": "ok", "ok": True,
+            "bik": bik, "name": name, "swift": swift,
+            "raw_bik_info": info["raw"],
+            "results": bik_results,
+            "candidate": bik_candidate,
+            "enriched": enriched,
+            "matched_via": "bikCode",
+            "variants_used": [],
+            "swift_query": None,
+        }
+
+    # ---- Step 3: SWIFT-based search via swiftBic property ------------
+    swift_results: list[dict] = []
+    swift_query: str | None = None
+    swift_candidate: dict | None = None
+    if swift:
+        swift_match = search_opensanctions_by_swift_bic(swift, api_key=api_key)
+        swift_results = swift_match.get("results") or []
+        swift_query = swift_match.get("swift_query")
+        swift_candidate = _pick_best_swift_candidate(swift_results)
+
+    # ---- Step 4: name-based fuzzy search -----------------------------
+    name_match = search_opensanctions_by_name(name, api_key=api_key)
+    if not name_match["ok"]:
+        return {"step": "match", "bik": bik, "name": name,
+                "swift": swift, "raw_bik_info": info["raw"], **name_match}
+    name_results = name_match["results"]
+    variants_used = name_match.get("variants_used", [])
+    name_candidate = _pick_best_candidate(name_results) if name_results else None
+
+    # Pick the strongest signal across SWIFT and name paths.
+    # SWIFT wins ties because it's a structured identifier — not subject
+    # to translation/transliteration noise.
+    candidate = None
+    matched_via = None
+    results_to_show = name_results
+    if swift_candidate and _has_sanction_signal(swift_candidate):
+        candidate = swift_candidate
+        matched_via = "swiftBic"
+        results_to_show = swift_results
+    elif name_candidate and _has_sanction_signal(name_candidate):
+        candidate = name_candidate
+        matched_via = "name"
+    elif name_candidate:
+        # Best overall candidate even if not sanctioned (for display)
+        candidate = name_candidate
+        matched_via = "name"
+    elif bik_candidate:
+        # Clean bikCode hit (the bank exists but isn't sanctioned)
         candidate = bik_candidate
-        results = bik_results
         matched_via = "bikCode"
-    else:
-        # ---- Step 3: name-based fallback (handles branches) ----------
-        name_match = search_opensanctions_by_name(name, api_key=api_key)
-        if not name_match["ok"]:
-            return {"step": "match", "bik": bik, "name": name,
-                    "raw_bik_info": info["raw"], **name_match}
-        results = name_match["results"]
-        variants_used = name_match.get("variants_used", [])
-        candidate = _pick_best_candidate(results)
-        if candidate:
-            matched_via = "name"
-        # If neither path produced a useful candidate, fall back to whatever
-        # bikCode returned (e.g. an unsanctioned but legitimate ID match)
-        if not candidate and bik_candidate:
-            candidate = bik_candidate
-            results = bik_results
-            matched_via = "bikCode"
+        results_to_show = bik_results
 
     enriched = None
     if candidate and candidate.get("id"):
@@ -635,13 +771,15 @@ def screen(bik: str, api_key: str | None) -> dict[str, Any]:
         "ok":            True,
         "bik":           bik,
         "name":          name,
+        "swift":         swift,
         "raw_bik_info":  info["raw"],
-        "results":       results,
+        "results":       results_to_show,
         "candidate":     candidate,
         "enriched":      enriched,
-        "variants_used": variants_used,
         "matched_via":   matched_via,
-        "bik_lookup_ok": bool(bik_results),
+        "variants_used": variants_used,
+        "swift_query":   swift_query,
+        "swift_results": swift_results,
     }
 
 
@@ -681,9 +819,10 @@ api_key = get_api_key()
 with st.sidebar:
     st.header("Pipeline")
     st.markdown(
-        "1. `bik-info.ru` → bank name\n"
-        "2. OpenSanctions `/match` with `bikCode` property (exact ID match)\n"
-        "3. Fallback: name search with Cyrillic→Latin transliteration"
+        "1. `bik-info.ru` → bank name + SWIFT\n"
+        "2. OpenSanctions `/match` by `bikCode` (exact ID)\n"
+        "3. OpenSanctions `/match` by `swiftBic` (≥ 50% → review)\n"
+        "4. OpenSanctions `/match` by name (transliterated, ≥ 20% → review)"
     )
     st.markdown("---")
     st.caption(
@@ -752,14 +891,47 @@ if run:
                 "Exact identifier match: this bank's BIK is recorded "
                 "directly on a sanctioned entity in OpenSanctions."
             )
-        elif sanctioned and score >= MATCH_STRONG:
+        elif sanctioned and matched_via == "swiftBic" and score >= SWIFT_MATCH_STRONG:
             st.markdown(
                 '<div style="background:#dc2626;color:white;padding:12px 16px;'
                 'border-radius:8px;font-weight:600;font-size:1.1rem;'
                 'display:inline-block;">❌ SANCTIONED</div>',
                 unsafe_allow_html=True,
             )
-        elif sanctioned and score >= MATCH_POSSIBLE:
+            st.caption(
+                "Exact SWIFT/BIC match: this bank's SWIFT code is recorded "
+                "directly on a sanctioned entity in OpenSanctions."
+            )
+        elif sanctioned and matched_via == "swiftBic" and score >= SWIFT_MATCH_REVIEW:
+            st.markdown(
+                '<div style="background:#f59e0b;color:white;padding:12px 16px;'
+                'border-radius:8px;font-weight:600;font-size:1.1rem;'
+                'display:inline-block;">⚠️ REVIEW NEEDED</div>',
+                unsafe_allow_html=True,
+            )
+            st.markdown(
+                f"A sanctioned entity matched **{bank_name}** by SWIFT/BIC "
+                f"at **{score:.0%}** — the bank code prefix overlaps with a "
+                f"sanctioned bank's SWIFT (likely a regional office or "
+                f"branch of the same banking group). Please verify."
+            )
+            if os_url:
+                st.markdown(
+                    f'<a href="{os_url}" target="_blank" '
+                    f'style="display:inline-block;background:#2563eb;'
+                    f'color:white;padding:10px 16px;border-radius:6px;'
+                    f'text-decoration:none;font-weight:600;margin-top:8px;">'
+                    f'🔍 Check the match on OpenSanctions ↗</a>',
+                    unsafe_allow_html=True,
+                )
+        elif sanctioned and matched_via == "name" and score >= MATCH_STRONG:
+            st.markdown(
+                '<div style="background:#dc2626;color:white;padding:12px 16px;'
+                'border-radius:8px;font-weight:600;font-size:1.1rem;'
+                'display:inline-block;">❌ SANCTIONED</div>',
+                unsafe_allow_html=True,
+            )
+        elif sanctioned and matched_via == "name" and score >= MATCH_POSSIBLE:
             st.markdown(
                 '<div style="background:#f59e0b;color:white;padding:12px 16px;'
                 'border-radius:8px;font-weight:600;font-size:1.1rem;'
@@ -785,6 +957,8 @@ if run:
 
         st.markdown("")  # spacer
         st.markdown(f"**Bank (from bik-info.ru):** {bank_name}")
+        if result.get("swift"):
+            st.markdown(f"**SWIFT / BIC:** `{result['swift']}`")
         st.markdown(
             f"**Matched OpenSanctions entity:** "
             f"{target_entity.get('caption', '—')}"
@@ -794,13 +968,22 @@ if run:
                 f"Resolved via exact `bikCode` property match · "
                 f"score: {score:.2f}"
             )
+        elif matched_via == "swiftBic":
+            st.caption(
+                f"Resolved via `swiftBic` property match · "
+                f"score: {score:.2f}  ({score:.0%})"
+            )
         elif matched_via == "name":
             st.caption(
                 f"Resolved via fuzzy name match (cross-script) · "
                 f"score: {score:.2f}  ({score:.0%})"
             )
 
-        if sanctioned and (matched_via == "bikCode" or score >= MATCH_POSSIBLE):
+        if sanctioned and (
+            matched_via == "bikCode"
+            or (matched_via == "swiftBic" and score >= SWIFT_MATCH_REVIEW)
+            or (matched_via == "name" and score >= MATCH_POSSIBLE)
+        ):
             countries = extract_sanction_countries(target_entity)
             if countries:
                 st.markdown("### Sanctioning jurisdictions")
