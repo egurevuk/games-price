@@ -315,7 +315,12 @@ def _synthetic_entity_from_directory(bik: str, info: dict) -> dict:
 # We therefore raise REVIEW rather than SANCTIONED when a bank is missing.
 
 OHMYSWIFT_URL = "https://ohmyswift.io/ne-pod-sankciyami-spisok"
-OHMYSWIFT_UA = "Mozilla/5.0 (BIK-Screener; +stape.io)"
+# Use a realistic browser UA — the custom 'BIK-Screener' UA gets 403'd by
+# ohmyswift.io's bot protection from cloud IPs (Streamlit Cloud, etc.).
+OHMYSWIFT_UA = (
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"
+)
 
 
 def _normalize_swift(code: str) -> str:
@@ -335,19 +340,25 @@ def _normalize_swift(code: str) -> str:
 def fetch_ohmyswift_whitelist() -> dict | None:
     """Download and parse the ohmyswift.io 'not sanctioned' list.
 
-    Returns ``{"swifts": set[str], "by_swift": dict[str, dict], "updated": str}``
-    where each entry in ``by_swift`` carries ``{"swift", "name_ru", "name_en"}``,
-    or ``None`` on failure (which the caller treats as "whitelist unavailable").
+    Returns ``{"swifts": set[str], "by_swift": dict[str, dict], "updated": str,
+    "count": int, "error": None}`` on success, or ``{"error": "..."}`` on
+    failure so the caller can surface diagnostics in the UI.
     """
     try:
         resp = requests.get(
             OHMYSWIFT_URL,
             timeout=20,
-            headers={"User-Agent": OHMYSWIFT_UA, "Accept-Language": "ru,en"},
+            headers={
+                "User-Agent": OHMYSWIFT_UA,
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                "Accept-Language": "ru,en;q=0.9",
+                "Accept-Encoding": "gzip, deflate, br",
+                "Cache-Control": "no-cache",
+            },
         )
         resp.raise_for_status()
-    except requests.RequestException:
-        return None
+    except requests.RequestException as exc:
+        return {"error": f"fetch failed: {type(exc).__name__}: {exc}"}
 
     html = resp.text
     # Each row has: <td><a href="...">SWIFT</a></td> <td>russian name</td> <td>english name</td>
@@ -408,11 +419,16 @@ def check_ohmyswift_whitelist(bank: dict) -> dict:
         "checked_swifts": [],
         "list_meta": None,
         "available": False,
+        "fetch_error": None,
     }
 
     wl = fetch_ohmyswift_whitelist()
-    if not wl:
-        return out  # leave available=False; caller decides how to handle
+    # New shape: dict with either {"swifts","by_swift",...} on success, or
+    # {"error": "..."} on failure. Old "None" form also tolerated.
+    if not wl or wl.get("error") or "swifts" not in wl:
+        if isinstance(wl, dict):
+            out["fetch_error"] = wl.get("error") or "unknown error"
+        return out
     out["available"] = True
     out["list_meta"] = {"count": wl["count"], "updated": wl["updated"]}
 
@@ -529,10 +545,11 @@ def is_sanctioned_topic(topics: list[str] | None) -> bool:
     return "sanction" in t
 
 
-# Datasets that are clear sanctions sources — used as a fallback signal
-# when topics aren't populated on a /search response.
+# Specific sanctions-list datasets. We intentionally EXCLUDE "sanctions"
+# and "default" — those are OpenSanctions aggregate collections that
+# contain every indexed entity, including non-sanctioned "entities of
+# interest", so they would produce false positives if treated as a signal.
 SANCTIONS_DATASETS_HINTS = {
-    "sanctions", "default",
     "us_ofac_sdn", "us_ofac_cons",
     "eu_fsf", "eu_sanctions_map", "eu_travel_bans",
     "gb_hmt_sanctions", "gb_fcdo_sanctions",
@@ -589,10 +606,17 @@ def classify(
     opensanctions_confirmed = False
 
     # === A. Collect every OpenSanctions signal first ====================
-
-    if bank_entity.get("target") is True:
-        opensanctions_confirmed = True
-        reasons.append("Bank entity is flagged as a sanctions `target` in OpenSanctions.")
+    #
+    # NOTE on the `target` field: OpenSanctions sets `target: true` for every
+    # entity in their tracked set — including "entity of interest, not on
+    # sanctions lists" entries like AO Raiffeisenbank. It is NOT a sanctions
+    # signal on its own. The reliable signals are:
+    #   1. topics contains "sanction"
+    #   2. entity belongs to a known sanctions dataset (ofac-sdn, eu-fsf, etc.)
+    #   3. nested Sanction objects exist (only present with ?nested=true)
+    # We rely on (1) and (2). The /match endpoint additionally returns
+    # match=true for confident identity matches; we treat that as sanctioned
+    # only when combined with a sanction topic or sanctions-dataset hit.
 
     topics = props.get("topics") or bank_entity.get("topics") or []
     if is_sanctioned_topic(topics):
@@ -600,9 +624,9 @@ def classify(
         reasons.append(f"Bank entity carries sanctions topic ({', '.join(topics)}).")
 
     datasets = bank_entity.get("datasets") or []
-    other_ds = [d for d in datasets if d != BANKS_DATASET]
-    sanction_ds_hits = [d for d in other_ds if d in SANCTIONS_DATASETS_HINTS
-                        or "sanction" in d.lower() or "ofac" in d.lower()]
+    sanction_ds_hits = [d for d in datasets if d in SANCTIONS_DATASETS_HINTS
+                        or "sanction" in d.lower() or "ofac" in d.lower()
+                        or "sdn" in d.lower()]
     if sanction_ds_hits:
         opensanctions_confirmed = True
         reasons.append(f"Bank appears in sanctions dataset(s): {', '.join(sanction_ds_hits)}.")
@@ -612,6 +636,11 @@ def classify(
         score = float(hit.get("score") or 0)
         hit_topics = (hit.get("properties", {}) or {}).get("topics") or \
                      hit.get("topics") or []
+        hit_datasets = hit.get("datasets") or []
+        hit_in_sanctions_ds = any(
+            d in SANCTIONS_DATASETS_HINTS or "sanction" in d.lower() or "ofac" in d.lower()
+            for d in hit_datasets
+        )
         top_hits.append({
             "id": hit.get("id"),
             "caption": hit.get("caption"),
@@ -619,13 +648,16 @@ def classify(
             "match": bool(hit.get("match")),
             "target": bool(hit.get("target")),
             "topics": hit_topics,
-            "datasets": hit.get("datasets", []),
+            "datasets": hit_datasets,
             "schema": hit.get("schema"),
         })
-        if hit.get("match") and (is_sanctioned_topic(hit_topics) or hit.get("target")):
+        # A confident /match hit only counts as SANCTIONED when paired with an
+        # actual sanctions signal (topic or dataset). `target=true` alone is
+        # not enough — see note above on OpenSanctions semantics.
+        if hit.get("match") and (is_sanctioned_topic(hit_topics) or hit_in_sanctions_ds):
             opensanctions_confirmed = True
             reasons.append(
-                f"/match returned a confirmed match: "
+                f"/match returned a confirmed sanctions match: "
                 f"\"{hit.get('caption')}\" score={score:.2f}"
                 + (f" topics=[{', '.join(hit_topics)}]" if hit_topics else "")
             )
@@ -1173,7 +1205,7 @@ with st.sidebar:
     st.divider()
     # OhMySwift whitelist status
     wl_meta = fetch_ohmyswift_whitelist()
-    if wl_meta:
+    if wl_meta and "swifts" in wl_meta:
         st.markdown(
             f"**📋 OhMySwift whitelist**  \n"
             f"{wl_meta['count']} banks, "
@@ -1186,7 +1218,12 @@ with st.sidebar:
             "appear here — OpenSanctions catches those."
         )
     else:
-        st.caption("📋 OhMySwift whitelist unavailable")
+        err = (wl_meta or {}).get("error") or "host unreachable from this server"
+        st.caption(
+            f"📋 OhMySwift whitelist unavailable — _{err}_. "
+            f"Verdicts fall back to OpenSanctions-only. "
+            f"[Open list manually ↗](https://ohmyswift.io/ne-pod-sankciyami-spisok)"
+        )
 
     st.divider()
     st.markdown(
