@@ -1338,6 +1338,12 @@ if not bic:
 
 st.markdown(f"### Screening BIC `{bic}`")
 
+# Placeholder for the bank summary block. Filled after Step 2 resolves all
+# identifiers and names. Using a placeholder lets the summary render in this
+# position (right under the search field) while the data that populates it
+# is gathered by later code — Streamlit otherwise renders strictly top-down.
+bank_summary_placeholder = st.empty()
+
 # Pre-fetch bik-info.ru silently so its data can be used as fallback hints
 # for CBR resolution (parent BIK and parent regnum unlock branch-BIC cases).
 with st.spinner("Looking up bank reference data…"):
@@ -1729,6 +1735,78 @@ with st.status("Step 3 · OpenSanctions /match — screening", expanded=True) as
         + (f", INN {inn_final}" if inn_final else ", no INN"),
         state="complete",
     )
+
+# ── Populate the bank-details summary block (placeholder near the top) ────
+# All identifier pools and names are now resolved (Step 1: CBR + iban.ru +
+# Dadata, Step 2: bik-info.ru, Step 3: OS reference enrichment). Filling
+# the placeholder here makes the summary visible right under the search
+# field while the verdict logic still runs below.
+with bank_summary_placeholder.container():
+    st.markdown("#### 🏦 Bank details")
+
+    # English name: Dadata's `name_english` is authoritative (from FNS/EGRUL)
+    # when present; fall back to the transliteration of the Russian name
+    # otherwise. Dadata may not return one for every bank.
+    name_english_display = (
+        dadata.get("name_english")
+        if isinstance(dadata, dict) and dadata.get("name_english")
+        else name_en
+    ) or "_(not resolved)_"
+
+    # BIC display: show the entered one prominently. If CBR returned more
+    # BICs for this credit organization (head office + branches), note that.
+    bic_extras = [b for b in (all_bics or []) if b != bic]
+    if bic_extras:
+        bic_display = f"`{bic}` _(+ {len(bic_extras)} other BIC(s) in the same credit org: {', '.join(f'`{b}`' for b in bic_extras[:5])}{' …' if len(bic_extras) > 5 else ''})_"
+    else:
+        bic_display = f"`{bic}`"
+
+    # SWIFT display: 8-char and 11-char forms together. Dedupe while
+    # preserving canonical 11-char first when both are present for the same
+    # institution, since the 11-char form is more informative (carries the
+    # branch code, e.g. VTBRRUM2MS2 vs the 8-char VTBRRUM2).
+    swift_display_list = []
+    seen_8: set[str] = set()
+    # 11-char first
+    for s in all_swifts or []:
+        if len(s) == 11 and s[:8] not in seen_8:
+            swift_display_list.append(s)
+            seen_8.add(s[:8])
+    # then 8-char that didn't have an 11-char companion
+    for s in all_swifts or []:
+        if len(s) == 8 and s not in seen_8:
+            swift_display_list.append(s)
+            seen_8.add(s)
+    swift_display = (
+        ", ".join(f"`{s}`" for s in swift_display_list)
+        if swift_display_list
+        else "_(none registered)_"
+    )
+
+    # INN — surface invalid shapes loudly so the analyst sees data-flow issues
+    inn_display = "_(not resolved)_"
+    if inn_final:
+        inn_clean = "".join(c for c in str(inn_final) if c.isdigit())
+        if len(inn_clean) in (10, 12):
+            inn_display = f"`{inn_clean}`"
+        else:
+            inn_display = (
+                f"⚠️ `{inn_final}` "
+                f"_(invalid INN shape: {len(inn_clean)} digits; "
+                "INNs must be 10 or 12)_"
+            )
+
+    rows = [
+        ("Original name", name_ru or "_(not resolved)_"),
+        ("Name in English", name_english_display),
+        ("BIC", bic_display),
+        ("INN", inn_display),
+        ("SWIFT", swift_display),
+    ]
+    table_md = "| | |\n|---|---|\n" + "\n".join(
+        f"| **{label}** | {value} |" for label, value in rows
+    )
+    st.markdown(table_md)
 
 # ─── STEP 4 ──────────────────────────────────────────────────────────────────
 st.markdown("## Step 4 · Verdict")
