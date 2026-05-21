@@ -1284,6 +1284,383 @@ def categorize_datasets(datasets: list[str] | None) -> dict[str, Any]:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Bulk screening: fetch full bank list, screen each, render PDF
+# ─────────────────────────────────────────────────────────────────────────────
+
+BIK_INFO_BASE_XML_URL = "https://bik-info.ru/base/base.xml"
+
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def fetch_bank_list_from_base_xml() -> list[dict[str, str]]:
+    """Fetch and parse the full list of Russian banks from bik-info.ru/base.xml.
+
+    Returns a list of dicts ``[{"bik": "...", "name": "...", "inn": "..."}, ...]``.
+    Deduplicates by BIK (the registry's natural primary key) and only includes
+    rows where BIK is a valid 9-digit numeric string.
+
+    The parser is intentionally defensive: bik-info.ru's XML schema isn't
+    documented publicly and could express bank data either as element children
+    (``<bank><bik>X</bik><name>Y</name></bank>``) or as attributes (``<bank
+    bik="X" name="Y"/>``). The function walks every element in the tree,
+    extracts candidate fields from both attributes and children, and accepts
+    any element that yielded a BIK-shaped value. Multiple namespace prefixes
+    are stripped via the ``}`` split for the same reason.
+
+    Cached for 24 hours since the bank registry only changes when CBR
+    licenses, revokes, or merges banks (handful of events per year).
+    """
+    try:
+        r = requests.get(BIK_INFO_BASE_XML_URL, timeout=60)
+        r.raise_for_status()
+    except Exception:
+        return []
+    try:
+        root = ET.fromstring(r.content)
+    except Exception:
+        return []
+
+    def _extract_fields(elem: ET.Element) -> dict[str, str]:
+        data: dict[str, str] = {}
+        # Attributes — strip namespace prefixes if any
+        for attr_name, attr_value in (elem.attrib or {}).items():
+            key = attr_name.lower().split("}")[-1]
+            val = (attr_value or "").strip()
+            if not val:
+                continue
+            if key in ("bik", "bic") and not data.get("bik"):
+                data["bik"] = val
+            elif key in ("name", "namebank", "shortname", "bank_name") and not data.get("name"):
+                data["name"] = val
+            elif key in ("namep", "fullname", "name_full") and not data.get("name_full"):
+                data["name_full"] = val
+            elif key in ("inn", "innbank") and not data.get("inn"):
+                data["inn"] = val
+        # Children
+        for child in elem:
+            tag = (child.tag or "").lower().split("}")[-1]
+            text = (child.text or "").strip()
+            if not text:
+                continue
+            if tag in ("bik", "bic") and not data.get("bik"):
+                data["bik"] = text
+            elif tag in ("name", "namebank", "shortname", "bank_name") and not data.get("name"):
+                data["name"] = text
+            elif tag in ("namep", "fullname", "name_full") and not data.get("name_full"):
+                data["name_full"] = text
+            elif tag in ("inn", "innbank") and not data.get("inn"):
+                data["inn"] = text
+        return data
+
+    banks: list[dict[str, str]] = []
+    seen_biks: set[str] = set()
+    for elem in root.iter():
+        data = _extract_fields(elem)
+        bik = data.get("bik", "")
+        if len(bik) != 9 or not bik.isdigit() or bik in seen_biks:
+            continue
+        seen_biks.add(bik)
+        # Promote name_full to name if we don't have a shorter name
+        if not data.get("name") and data.get("name_full"):
+            data["name"] = data["name_full"]
+        banks.append(data)
+    return banks
+
+
+# Verdict-state constants for the bulk-screening path. Mirror the colour
+# scheme used in Step 4's UI.
+VERDICT_WHITELISTED = "WHITELISTED"
+VERDICT_MATCH = "MATCH"           # 🔴 strict hit AND OFAC
+VERDICT_REVIEW = "REVIEW"         # 🟡 strict hit, no OFAC
+VERDICT_CLEAR = "CLEAR"           # 🟢 no strict hit
+VERDICT_ERROR = "ERROR"           # ⚠️ screening failed (network/parse/etc)
+
+VERDICT_EMOJI: dict[str, str] = {
+    VERDICT_WHITELISTED: "✅",
+    VERDICT_MATCH: "🔴",
+    VERDICT_REVIEW: "🟡",
+    VERDICT_CLEAR: "🟢",
+    VERDICT_ERROR: "⚠️",
+}
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def screen_bank_simple(
+    bik: str,
+    name: str,
+    inn: str,
+    api_key: str,
+) -> dict[str, str]:
+    """Headless verdict for a single bank — used by the bulk PDF generator.
+
+    Same verdict logic as the interactive Step 4 (whitelist → strict-search →
+    OS-side whitelist → OFAC split), but without UI side effects so it can be
+    called in a tight loop over hundreds of banks.
+
+    Caching: 1h TTL per (bik, name, inn, api_key) tuple. The TTL is shorter
+    than the 24h on ``fetch_bank_list_from_base_xml`` because sanctions lists
+    can change overnight (mid-week OFAC updates are common) and the bulk
+    PDF should pick those up promptly when regenerated.
+
+    Returns ``{"verdict": str, "emoji": str, "detail": str}`` where verdict
+    is one of the ``VERDICT_*`` constants and detail is a short human-readable
+    explanation suitable for a PDF cell.
+    """
+    try:
+        whitelist = load_whitelist_swifts()
+        wl_swifts = set(whitelist.keys())
+
+        # 1. Resolve SWIFT from iban.ru (the cheap cached lookup; we don't
+        # call CBR/Dadata in bulk mode to keep the per-bank cost minimal)
+        iban_swift = iban_ru_swift_for_bic(bik)
+        swifts_8: set[str] = set()
+        if iban_swift:
+            s8 = iban_swift[:8].upper()
+            if re.match(r"^[A-Z]{4}[A-Z]{2}[A-Z0-9]{2}$", s8):
+                swifts_8.add(s8)
+
+        # 2. Input-side whitelist check
+        wl_hit = swifts_8 & wl_swifts
+        if wl_hit:
+            return {
+                "verdict": VERDICT_WHITELISTED,
+                "emoji": VERDICT_EMOJI[VERDICT_WHITELISTED],
+                "detail": f"SWIFT {next(iter(wl_hit))} on OhMySwift",
+            }
+
+        if not api_key:
+            return {
+                "verdict": VERDICT_ERROR,
+                "emoji": VERDICT_EMOJI[VERDICT_ERROR],
+                "detail": "no OpenSanctions API key",
+            }
+
+        # 3. Strict identifier search — BIK, SWIFT, INN (validated)
+        hits: dict[str, dict] = {}
+        # BIK
+        r1 = opensanctions_search_by_property(api_key, "bikCode", bik)
+        for e in r1.get("results", []) or []:
+            if e.get("id"):
+                hits[e["id"]] = e
+        # SWIFT
+        for s8 in swifts_8:
+            rs = opensanctions_search_by_property(api_key, "swiftBic", s8)
+            for e in rs.get("results", []) or []:
+                if e.get("id"):
+                    hits[e["id"]] = e
+        # INN (validate first)
+        clean_inn = "".join(c for c in str(inn or "") if c.isdigit())
+        if len(clean_inn) in (10, 12):
+            ri = opensanctions_search_by_property(api_key, "innCode", clean_inn)
+            for e in ri.get("results", []) or []:
+                if e.get("id"):
+                    hits[e["id"]] = e
+
+        # 4. OS-side per-entity whitelist filter — if an entity's OS-stored
+        # SWIFT is on the OhMySwift list, treat it as whitelisted
+        real_hits: dict[str, dict] = {}
+        any_os_wl = False
+        for eid, entity in hits.items():
+            entity_swifts = (entity.get("properties") or {}).get("swiftBic") or []
+            e8 = {s.strip().upper()[:8] for s in entity_swifts if isinstance(s, str) and len(s.strip()) >= 8}
+            if e8 & wl_swifts:
+                any_os_wl = True
+                continue
+            real_hits[eid] = entity
+
+        if not real_hits:
+            if any_os_wl:
+                return {
+                    "verdict": VERDICT_WHITELISTED,
+                    "emoji": VERDICT_EMOJI[VERDICT_WHITELISTED],
+                    "detail": "OS-side: matched entity SWIFT on whitelist",
+                }
+            return {
+                "verdict": VERDICT_CLEAR,
+                "emoji": VERDICT_EMOJI[VERDICT_CLEAR],
+                "detail": "no strict identifier match",
+            }
+
+        # 5. OFAC split
+        if any(entity_has_ofac(e) for e in real_hits.values()):
+            return {
+                "verdict": VERDICT_MATCH,
+                "emoji": VERDICT_EMOJI[VERDICT_MATCH],
+                "detail": f"OFAC sanctioned ({len(real_hits)} entity)",
+            }
+        return {
+            "verdict": VERDICT_REVIEW,
+            "emoji": VERDICT_EMOJI[VERDICT_REVIEW],
+            "detail": f"non-OFAC match ({len(real_hits)} entity)",
+        }
+    except Exception as exc:
+        return {
+            "verdict": VERDICT_ERROR,
+            "emoji": VERDICT_EMOJI[VERDICT_ERROR],
+            "detail": f"screening failed: {exc}",
+        }
+
+
+def _register_cyrillic_font_for_pdf() -> str:
+    """Register a Unicode-capable font with reportlab for Cyrillic support.
+
+    ReportLab's built-in fonts (Helvetica, Times-Roman) don't include Cyrillic
+    glyphs. DejaVu Sans is the standard fallback on Linux servers (including
+    Streamlit Cloud's Debian image) and covers full Cyrillic + Latin Extended.
+
+    Returns the registered font name, or "Helvetica" if no suitable font was
+    found (in which case Cyrillic bank names will render as boxes — degraded
+    but the PDF still produces correctly).
+    """
+    from reportlab.pdfbase import pdfmetrics
+    from reportlab.pdfbase.ttfonts import TTFont
+
+    candidates = [
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSansCondensed.ttf",
+        "/usr/share/fonts/dejavu/DejaVuSans.ttf",
+        "/usr/share/fonts/TTF/DejaVuSans.ttf",
+        "/Library/Fonts/Arial Unicode.ttf",  # macOS dev fallback
+    ]
+    for path in candidates:
+        if os.path.exists(path):
+            try:
+                pdfmetrics.registerFont(TTFont("BankFont", path))
+                return "BankFont"
+            except Exception:
+                continue
+    return "Helvetica"
+
+
+def generate_screening_pdf(
+    banks_with_verdicts: list[tuple[dict[str, str], dict[str, str]]],
+) -> bytes:
+    """Render the bulk-screening table as a PDF.
+
+    Args:
+        banks_with_verdicts: list of (bank_info, verdict_info) tuples where
+            bank_info has bik/name/inn keys and verdict_info has verdict/
+            emoji/detail keys.
+
+    Layout: cover paragraph with summary counts, then a single sorted table
+    (red first, then yellow, then white, green, error). Row backgrounds are
+    color-coded by verdict so the file is scannable when printed.
+    """
+    from io import BytesIO
+    from reportlab.lib.pagesizes import A4
+    from reportlab.platypus import (
+        SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle,
+    )
+    from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+    from reportlab.lib import colors
+    from reportlab.lib.units import cm
+
+    font_name = _register_cyrillic_font_for_pdf()
+    buffer = BytesIO()
+    doc = SimpleDocTemplate(
+        buffer,
+        pagesize=A4,
+        leftMargin=1.5 * cm,
+        rightMargin=1.5 * cm,
+        topMargin=1.5 * cm,
+        bottomMargin=1.5 * cm,
+        title="Russian Banks — OpenSanctions Screening",
+    )
+    styles = getSampleStyleSheet()
+    title_style = ParagraphStyle(
+        "BulkTitle", parent=styles["Title"], fontName=font_name, fontSize=16, spaceAfter=8,
+    )
+    body_style = ParagraphStyle(
+        "BulkBody", parent=styles["Normal"], fontName=font_name, fontSize=9,
+    )
+    cell_style = ParagraphStyle(
+        "BulkCell", parent=styles["Normal"], fontName=font_name, fontSize=8, leading=10,
+    )
+
+    counts: dict[str, int] = {}
+    for _, v in banks_with_verdicts:
+        counts[v["verdict"]] = counts.get(v["verdict"], 0) + 1
+
+    story: list[Any] = []
+    story.append(Paragraph("Russian Banks — OpenSanctions Screening", title_style))
+    story.append(Paragraph(
+        f"Source: bik-info.ru/base.xml &nbsp;·&nbsp; "
+        f"Total banks: <b>{len(banks_with_verdicts)}</b> &nbsp;·&nbsp; "
+        f"Verdict logic: input-SWIFT whitelist → strict identifier search "
+        f"(BIK / SWIFT / INN) → OS-SWIFT whitelist → OFAC split",
+        body_style,
+    ))
+    story.append(Spacer(1, 8))
+    summary_html = " &nbsp;·&nbsp; ".join(
+        f"{VERDICT_EMOJI[k]} <b>{k}:</b> {counts.get(k, 0)}"
+        for k in (VERDICT_MATCH, VERDICT_REVIEW, VERDICT_WHITELISTED, VERDICT_CLEAR, VERDICT_ERROR)
+    )
+    story.append(Paragraph(summary_html, body_style))
+    story.append(Spacer(1, 12))
+
+    # Sort: most severe first (red, yellow, then white, green, errors)
+    order = {
+        VERDICT_MATCH: 0,
+        VERDICT_REVIEW: 1,
+        VERDICT_WHITELISTED: 2,
+        VERDICT_CLEAR: 3,
+        VERDICT_ERROR: 4,
+    }
+    sorted_banks = sorted(
+        banks_with_verdicts,
+        key=lambda x: (order.get(x[1]["verdict"], 99), x[0].get("bik", "")),
+    )
+
+    table_data: list[list[Any]] = [["BIC", "Bank Name", "Verdict"]]
+    for bank, verdict in sorted_banks:
+        name = bank.get("name", "") or "(no name)"
+        # Truncate very long names to keep the row at a sane height
+        if len(name) > 120:
+            name = name[:117] + "…"
+        verdict_cell = f"{verdict['emoji']} {verdict['verdict']}"
+        if verdict.get("detail"):
+            verdict_cell += f"<br/><font size='7' color='#666666'>{verdict['detail']}</font>"
+        table_data.append([
+            Paragraph(bank.get("bik", ""), cell_style),
+            Paragraph(name, cell_style),
+            Paragraph(verdict_cell, cell_style),
+        ])
+
+    table = Table(
+        table_data,
+        colWidths=[2.4 * cm, 10.5 * cm, 4.6 * cm],
+        repeatRows=1,  # repeat header on every page
+    )
+    table_style_cmds = [
+        ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#1f2937")),
+        ("TEXTCOLOR",  (0, 0), (-1, 0), colors.white),
+        ("FONTNAME",   (0, 0), (-1, -1), font_name),
+        ("FONTSIZE",   (0, 0), (-1, 0), 10),
+        ("ALIGN",      (0, 0), (-1, 0), "CENTER"),
+        ("VALIGN",     (0, 0), (-1, -1), "TOP"),
+        ("GRID",       (0, 0), (-1, -1), 0.4, colors.HexColor("#cccccc")),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 3),
+        ("TOPPADDING",    (0, 0), (-1, -1), 3),
+    ]
+    # Per-row tinting by verdict
+    row_tint = {
+        VERDICT_MATCH:       colors.HexColor("#fee2e2"),  # light red
+        VERDICT_REVIEW:      colors.HexColor("#fef3c7"),  # light amber
+        VERDICT_WHITELISTED: colors.HexColor("#dcfce7"),  # light green
+        VERDICT_CLEAR:       colors.HexColor("#f9fafb"),  # very light grey
+        VERDICT_ERROR:       colors.HexColor("#e5e7eb"),  # neutral grey
+    }
+    for i, (_, v) in enumerate(sorted_banks, start=1):
+        tint = row_tint.get(v["verdict"])
+        if tint is not None:
+            table_style_cmds.append(("BACKGROUND", (0, i), (-1, i), tint))
+    table.setStyle(TableStyle(table_style_cmds))
+    story.append(table)
+
+    doc.build(story)
+    return buffer.getvalue()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Streamlit UI
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -1315,6 +1692,117 @@ with st.sidebar:
         "🟡 **Review** — strict hit, no US OFAC  \n"
         "🟢 **Clear** — no whitelist, no strict hit"
     )
+
+    # ── Bulk screening: full Russian-bank list as PDF ─────────────────
+    st.markdown("---")
+    with st.expander("📊 Full bank list (PDF)", expanded=False):
+        st.caption(
+            "Bulk-screen every Russian bank in "
+            "[bik-info.ru/base.xml](https://bik-info.ru/base/base.xml) and "
+            "produce a PDF with **BIC**, **bank name**, and **verdict**."
+        )
+        if st.button("🔄 Generate / refresh PDF", use_container_width=True):
+            st.session_state["bulk_pdf_run"] = True
+            st.session_state["bulk_pdf"] = None
+        if st.session_state.get("bulk_pdf"):
+            st.success(
+                f"PDF ready — {st.session_state.get('bulk_pdf_count', '?')} banks "
+                f"screened {st.session_state.get('bulk_pdf_when', '')}"
+            )
+            st.download_button(
+                "⬇️ Download PDF",
+                data=st.session_state["bulk_pdf"],
+                file_name="russian_banks_screening.pdf",
+                mime="application/pdf",
+                use_container_width=True,
+            )
+        else:
+            st.caption(
+                "_The first run takes a few minutes (one /search per bank). "
+                "Subsequent runs reuse the per-bank cache (1h TTL)._"
+            )
+
+# ── Bulk PDF generation (runs in place of regular screening) ─────────────
+# Triggered by the sidebar button which sets session_state["bulk_pdf_run"].
+# We handle it here, before the regular BIC input, so the bulk flow can run
+# without requiring the user to also enter a BIC. The final `st.stop()`
+# below prevents the regular screening UI from rendering on top.
+if st.session_state.get("bulk_pdf_run") and not st.session_state.get("bulk_pdf"):
+    st.markdown("## 📊 Bulk screening — generating PDF")
+    st.caption(
+        "Fetching the full Russian bank list from bik-info.ru/base.xml, "
+        "running the same verdict logic as the interactive tool, and "
+        "compiling a PDF. The first run takes a few minutes; per-bank "
+        "results are cached for 1 hour so subsequent runs are faster."
+    )
+    bulk_progress = st.progress(0.0)
+    bulk_status = st.empty()
+
+    bulk_status.info("Step 1/3 · Fetching base.xml from bik-info.ru…")
+    banks = fetch_bank_list_from_base_xml()
+    if not banks:
+        st.error(
+            "Couldn't fetch or parse `https://bik-info.ru/base/base.xml`. "
+            "The endpoint may be temporarily unavailable or the XML schema "
+            "may have changed. Click **Generate / refresh PDF** again later, "
+            "or check the network from the deployment."
+        )
+        st.session_state["bulk_pdf_run"] = False
+        st.stop()
+    bulk_status.info(
+        f"Step 2/3 · Screening {len(banks)} banks against OpenSanctions "
+        "(cached per BIC, so already-screened banks are instant)…"
+    )
+
+    # Per-bank screening with progress updates
+    results: list[tuple[dict[str, str], dict[str, str]]] = []
+    for i, bank in enumerate(banks):
+        verdict = screen_bank_simple(
+            bank["bik"],
+            bank.get("name", ""),
+            bank.get("inn", ""),
+            OPENSANCTIONS_API_KEY,
+        )
+        results.append((bank, verdict))
+        # Update progress + status every bank (cheap), or every 10 if many
+        bulk_progress.progress((i + 1) / len(banks))
+        if i % 10 == 0 or i == len(banks) - 1:
+            short_name = (bank.get("name") or bank["bik"])[:60]
+            bulk_status.info(
+                f"Step 2/3 · {i + 1}/{len(banks)} — `{bank['bik']}` "
+                f"{short_name} → {verdict['emoji']} {verdict['verdict']}"
+            )
+
+    bulk_status.info("Step 3/3 · Rendering PDF…")
+    try:
+        pdf_bytes = generate_screening_pdf(results)
+    except Exception as exc:
+        st.error(f"PDF generation failed: {exc}")
+        st.session_state["bulk_pdf_run"] = False
+        st.stop()
+
+    # Persist in session state so the sidebar's download button picks it up
+    from datetime import datetime
+    st.session_state["bulk_pdf"] = pdf_bytes
+    st.session_state["bulk_pdf_count"] = len(banks)
+    st.session_state["bulk_pdf_when"] = datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
+    st.session_state["bulk_pdf_run"] = False
+
+    bulk_progress.empty()
+    bulk_status.success(
+        f"✅ PDF generated — {len(banks)} banks screened. "
+        "**Download from the sidebar.**"
+    )
+    # Verdict summary
+    counts: dict[str, int] = {}
+    for _, v in results:
+        counts[v["verdict"]] = counts.get(v["verdict"], 0) + 1
+    summary = " · ".join(
+        f"{VERDICT_EMOJI[k]} **{k}**: {counts.get(k, 0)}"
+        for k in (VERDICT_MATCH, VERDICT_REVIEW, VERDICT_WHITELISTED, VERDICT_CLEAR, VERDICT_ERROR)
+    )
+    st.markdown(summary)
+    st.stop()
 
 col1, col2 = st.columns([3, 1])
 with col1:
