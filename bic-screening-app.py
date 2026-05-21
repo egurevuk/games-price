@@ -1848,6 +1848,7 @@ if st.session_state.get("bulk_pdf_run") and not st.session_state.get("bulk_pdf")
         st.stop()
 
     # Persist in session state so the sidebar's download button picks it up
+    # on the next rerun (sidebar already rendered before the bulk job ran).
     from datetime import datetime
     st.session_state["bulk_pdf"] = pdf_bytes
     st.session_state["bulk_pdf_count"] = len(banks)
@@ -1855,10 +1856,21 @@ if st.session_state.get("bulk_pdf_run") and not st.session_state.get("bulk_pdf")
     st.session_state["bulk_pdf_run"] = False
 
     bulk_progress.empty()
-    bulk_status.success(
-        f"✅ PDF generated — {len(banks)} banks screened. "
-        "**Download from the sidebar.**"
+    bulk_status.success(f"✅ PDF generated — {len(banks)} banks screened.")
+
+    # Render the download button INLINE in the main panel. The sidebar is
+    # already rendered at this point so it'd take a rerun to update there,
+    # and a rerun would clear the visible success message + verdict summary.
+    # Inline is the better UX: download button sits right where the user's
+    # eyes already are, and the sidebar will pick it up on next rerun.
+    st.download_button(
+        "⬇️ Download PDF",
+        data=pdf_bytes,
+        file_name=f"russian_banks_screening_{datetime.utcnow().strftime('%Y%m%d_%H%M')}.pdf",
+        mime="application/pdf",
+        type="primary",
     )
+
     # Verdict summary
     counts: dict[str, int] = {}
     for _, v in results:
@@ -1868,6 +1880,11 @@ if st.session_state.get("bulk_pdf_run") and not st.session_state.get("bulk_pdf")
         for k in (VERDICT_MATCH, VERDICT_REVIEW, VERDICT_WHITELISTED, VERDICT_CLEAR, VERDICT_ERROR)
     )
     st.markdown(summary)
+    st.caption(
+        "_The download button also appears in the sidebar after your next "
+        "interaction with the app (e.g. screening a single BIC). The PDF "
+        "stays available for the rest of this browser session._"
+    )
     st.stop()
 
 col1, col2 = st.columns([3, 1])
