@@ -1546,46 +1546,112 @@ def screen_bank_simple(
         }
 
 
+# Module-level cache for the registered font name. We pay the registration
+# cost (and potential GitHub download) once per process; subsequent PDF
+# generations reuse this. Without caching, every PDF would re-register and
+# potentially re-download.
+_CYRILLIC_FONT_CACHE: str | None = None
+
+
 def _register_cyrillic_font_for_pdf() -> str:
     """Register a Unicode-capable font with reportlab for Cyrillic support.
 
-    ReportLab's built-in fonts (Helvetica, Times-Roman) don't include Cyrillic
-    glyphs. DejaVu Sans is the standard fallback on Linux servers (including
-    Streamlit Cloud's Debian image) and covers full Cyrillic + Latin Extended.
+    ReportLab's built-in fonts (Helvetica, Times-Roman) only cover Latin-1.
+    Without a registered Cyrillic-capable font, every Russian glyph in bank
+    names renders as ``■`` (the "missing glyph" tofu box).
 
-    Returns the registered font name, or "Helvetica" if no suitable font was
-    found (in which case Cyrillic bank names will render as boxes — degraded
-    but the PDF still produces correctly).
+    Strategy in priority order:
+      1. Use the cached font name from a previous call (no I/O).
+      2. Check matplotlib's bundled DejaVu Sans — matplotlib ships it as a
+         pip-installable dependency, so if it's in the environment for
+         charting we can borrow its font file at no extra cost.
+      3. Check standard system font paths populated by ``fonts-dejavu-core``
+         (installed via ``packages.txt`` on Streamlit Cloud) and other
+         common Linux/macOS/Windows locations.
+      4. Download DejaVu Sans from the dejavu-fonts GitHub repo as a last
+         resort. Cached in ``/tmp/DejaVuSans.ttf`` so subsequent calls in
+         the same container are fast.
+      5. Fall back to Helvetica with no Cyrillic — better than crashing,
+         but the PDF will still have tofu boxes for Russian text.
 
-    Imports are local because reportlab is an optional dependency only needed
-    when bulk PDFs are generated; the rest of the app shouldn't fail to load
-    if reportlab is missing from requirements.txt.
+    Returns the registered font name.
     """
+    global _CYRILLIC_FONT_CACHE
+    if _CYRILLIC_FONT_CACHE is not None:
+        return _CYRILLIC_FONT_CACHE
+
     try:
         from reportlab.pdfbase import pdfmetrics
         from reportlab.pdfbase.ttfonts import TTFont
     except ImportError:
-        return "Helvetica"
+        _CYRILLIC_FONT_CACHE = "Helvetica"
+        return _CYRILLIC_FONT_CACHE
 
-    candidates = [
+    # Build search list in priority order
+    candidates: list[str] = []
+
+    # matplotlib's bundled DejaVu — most reliable across deployments since
+    # matplotlib is a common transitive dependency and ships the font
+    try:
+        import matplotlib  # noqa: F401  (only used for data path)
+        mpl_path = os.path.join(
+            matplotlib.get_data_path(), "fonts", "ttf", "DejaVuSans.ttf"
+        )
+        candidates.append(mpl_path)
+    except Exception:
+        pass
+
+    # System font paths
+    candidates.extend([
         "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
         "/usr/share/fonts/truetype/dejavu/DejaVuSansCondensed.ttf",
         "/usr/share/fonts/dejavu/DejaVuSans.ttf",
         "/usr/share/fonts/TTF/DejaVuSans.ttf",
-        "/Library/Fonts/Arial Unicode.ttf",  # macOS dev fallback
-    ]
+        "/usr/local/share/fonts/DejaVuSans.ttf",
+        "/Library/Fonts/Arial Unicode.ttf",
+        "/System/Library/Fonts/Supplemental/Arial Unicode.ttf",
+        "C:/Windows/Fonts/arial.ttf",
+        "/tmp/DejaVuSans.ttf",  # downloaded-and-cached from a prior call
+    ])
+
     for path in candidates:
         if os.path.exists(path):
             try:
                 pdfmetrics.registerFont(TTFont("BankFont", path))
-                return "BankFont"
+                _CYRILLIC_FONT_CACHE = "BankFont"
+                return _CYRILLIC_FONT_CACHE
             except Exception:
                 continue
-    return "Helvetica"
+
+    # GitHub download fallback — used when neither matplotlib nor any system
+    # font path worked. dejavu-fonts is permissively licensed (Bitstream Vera
+    # license) so redistribution is fine.
+    download_path = "/tmp/DejaVuSans.ttf"
+    try:
+        font_url = (
+            "https://github.com/dejavu-fonts/dejavu-fonts/raw/"
+            "version_2_37/ttf/DejaVuSans.ttf"
+        )
+        r = requests.get(font_url, timeout=30)
+        r.raise_for_status()
+        with open(download_path, "wb") as f:
+            f.write(r.content)
+        pdfmetrics.registerFont(TTFont("BankFont", download_path))
+        _CYRILLIC_FONT_CACHE = "BankFont"
+        return _CYRILLIC_FONT_CACHE
+    except Exception:
+        pass
+
+    # Final fallback — Cyrillic will be tofu boxes but PDF still generates
+    _CYRILLIC_FONT_CACHE = "Helvetica"
+    return _CYRILLIC_FONT_CACHE
 
 
 def generate_screening_pdf(
     banks_with_verdicts: list[tuple[dict[str, str], dict[str, str]]],
+    *,
+    filter_to: set[str] | None = None,
+    full_screening_counts: dict[str, int] | None = None,
 ) -> bytes:
     """Render the bulk-screening table as a PDF.
 
@@ -1593,15 +1659,34 @@ def generate_screening_pdf(
         banks_with_verdicts: list of (bank_info, verdict_info) tuples where
             bank_info has bik/name/inn keys and verdict_info has verdict/
             emoji/detail keys.
+        filter_to: optional set of verdict constants (e.g. ``{VERDICT_WHITELISTED}``).
+            If set, only banks whose verdict is in this set appear in the PDF.
+            The cover paragraph reports both the filtered count and the
+            ``full_screening_counts`` so the document is self-explanatory.
+        full_screening_counts: total verdict counts across the unfiltered
+            screening run, used in the cover paragraph for context. If None,
+            counts are computed from ``banks_with_verdicts`` post-filter.
 
     Layout: cover paragraph with summary counts, then a single sorted table
     (red first, then yellow, then white, green, error). Row backgrounds are
     color-coded by verdict so the file is scannable when printed.
 
+    Verdict cells in the table use **text-only labels** (no emoji prefix)
+    because the registered Cyrillic font (DejaVu Sans) doesn't carry color
+    emoji glyphs — using emoji would render as tofu boxes and obscure the
+    real text. Row background colors already convey severity visually.
+
     Raises a clear error message if reportlab is not installed — this is
     common during initial deployment when ``requirements.txt`` hasn't been
     refreshed alongside the source file.
     """
+    # Apply filter if requested. Done first so all downstream sorting,
+    # counting, and rendering only sees the filtered set.
+    if filter_to is not None:
+        banks_with_verdicts = [
+            (b, v) for b, v in banks_with_verdicts if v.get("verdict") in filter_to
+        ]
+
     try:
         from io import BytesIO
         from reportlab.lib.pagesizes import A4
@@ -1646,22 +1731,56 @@ def generate_screening_pdf(
     for _, v in banks_with_verdicts:
         counts[v["verdict"]] = counts.get(v["verdict"], 0) + 1
 
+    # Title varies with filter — a filtered PDF should make its scope clear
+    # so a reader who picks it up out of context understands what's in it.
+    if filter_to == {VERDICT_WHITELISTED}:
+        title_text = "Russian Banks — Whitelisted (Not Under US/EU Sanctions)"
+    elif filter_to:
+        labels = ", ".join(sorted(filter_to))
+        title_text = f"Russian Banks — {labels}"
+    else:
+        title_text = "Russian Banks — OpenSanctions Screening"
+
     story: list[Any] = []
-    story.append(Paragraph("Russian Banks — OpenSanctions Screening", title_style))
-    story.append(Paragraph(
+    story.append(Paragraph(title_text, title_style))
+
+    # Cover paragraph: source, filter scope, and verdict logic
+    cover_lines = [
         f"Source: bik-info.ru/base.xml &nbsp;·&nbsp; "
-        f"Total banks: <b>{len(banks_with_verdicts)}</b> &nbsp;·&nbsp; "
-        f"Verdict logic: input-SWIFT whitelist → strict identifier search "
-        f"(BIK / SWIFT / INN) → OS-SWIFT whitelist → OFAC split",
-        body_style,
-    ))
-    story.append(Spacer(1, 8))
-    summary_html = " &nbsp;·&nbsp; ".join(
-        f"{VERDICT_EMOJI[k]} <b>{k}:</b> {counts.get(k, 0)}"
-        for k in (VERDICT_MATCH, VERDICT_REVIEW, VERDICT_WHITELISTED, VERDICT_CLEAR, VERDICT_ERROR)
+        f"Banks in this PDF: <b>{len(banks_with_verdicts)}</b>"
+    ]
+    if full_screening_counts:
+        total_full = sum(full_screening_counts.values())
+        cover_lines.append(
+            f"Full screening covered <b>{total_full}</b> banks total; "
+            "this PDF is filtered to "
+            + (
+                "whitelisted only"
+                if filter_to == {VERDICT_WHITELISTED}
+                else ", ".join(sorted(filter_to)) if filter_to else "all verdicts"
+            )
+            + "."
+        )
+    cover_lines.append(
+        "Verdict logic: input-SWIFT whitelist → strict identifier search "
+        "(BIK / SWIFT / INN) → OS-SWIFT whitelist → OFAC split."
     )
-    story.append(Paragraph(summary_html, body_style))
-    story.append(Spacer(1, 12))
+    story.append(Paragraph("<br/>".join(cover_lines), body_style))
+    story.append(Spacer(1, 8))
+
+    # Verdict counts. Use full counts when available so a filtered PDF still
+    # shows the population context (e.g. "190 whitelisted out of 1430 total").
+    # Plain-text labels — no emoji, since the registered Cyrillic font
+    # doesn't carry color emoji glyphs.
+    display_counts = full_screening_counts if full_screening_counts else counts
+    summary_html = " &nbsp;·&nbsp; ".join(
+        f"<b>{k}:</b> {display_counts.get(k, 0)}"
+        for k in (VERDICT_MATCH, VERDICT_REVIEW, VERDICT_WHITELISTED, VERDICT_CLEAR, VERDICT_ERROR)
+        if display_counts.get(k, 0) > 0
+    )
+    if summary_html:
+        story.append(Paragraph(summary_html, body_style))
+        story.append(Spacer(1, 12))
 
     # Sort: most severe first (red, yellow, then white, green, errors)
     order = {
@@ -1682,7 +1801,11 @@ def generate_screening_pdf(
         # Truncate very long names to keep the row at a sane height
         if len(name) > 120:
             name = name[:117] + "…"
-        verdict_cell = f"{verdict['emoji']} {verdict['verdict']}"
+        # Text-only verdict label — no emoji prefix, because DejaVu Sans
+        # doesn't carry color emoji glyphs and they'd render as tofu boxes.
+        # The row background color (set via table style below) conveys
+        # severity visually.
+        verdict_cell = f"<b>{verdict['verdict']}</b>"
         if verdict.get("detail"):
             verdict_cell += f"<br/><font size='7' color='#666666'>{verdict['detail']}</font>"
         table_data.append([
@@ -1765,20 +1888,22 @@ with st.sidebar:
         st.caption(
             "Bulk-screen every Russian bank in "
             "[bik-info.ru/base.xml](https://bik-info.ru/base/base.xml) and "
-            "produce a PDF with **BIC**, **bank name**, and **verdict**."
+            "produce a PDF of **whitelisted banks only** (not under US/EU "
+            "sanctions) — the actionable list for transacting safely."
         )
         if st.button("🔄 Generate / refresh PDF", use_container_width=True):
             st.session_state["bulk_pdf_run"] = True
             st.session_state["bulk_pdf"] = None
         if st.session_state.get("bulk_pdf"):
             st.success(
-                f"PDF ready — {st.session_state.get('bulk_pdf_count', '?')} banks "
-                f"screened {st.session_state.get('bulk_pdf_when', '')}"
+                f"PDF ready — {st.session_state.get('bulk_pdf_count', '?')} "
+                f"whitelisted banks · generated "
+                f"{st.session_state.get('bulk_pdf_when', '')}"
             )
             st.download_button(
                 "⬇️ Download PDF",
                 data=st.session_state["bulk_pdf"],
-                file_name="russian_banks_screening.pdf",
+                file_name="russian_banks_whitelisted.pdf",
                 mime="application/pdf",
                 use_container_width=True,
             )
@@ -1840,23 +1965,41 @@ if st.session_state.get("bulk_pdf_run") and not st.session_state.get("bulk_pdf")
             )
 
     bulk_status.info("Step 3/3 · Rendering PDF…")
+
+    # Compute full screening counts (across all 1430 banks) for the cover
+    # paragraph. The PDF itself is filtered to WHITELISTED only — those are
+    # the actionable, transactable banks — but the cover shows the broader
+    # population context so the document is interpretable on its own.
+    full_counts: dict[str, int] = {}
+    for _, v in results:
+        full_counts[v["verdict"]] = full_counts.get(v["verdict"], 0) + 1
+
     try:
-        pdf_bytes = generate_screening_pdf(results)
+        pdf_bytes = generate_screening_pdf(
+            results,
+            filter_to={VERDICT_WHITELISTED},
+            full_screening_counts=full_counts,
+        )
     except Exception as exc:
         st.error(f"PDF generation failed: {exc}")
         st.session_state["bulk_pdf_run"] = False
         st.stop()
 
+    n_whitelisted = full_counts.get(VERDICT_WHITELISTED, 0)
+
     # Persist in session state so the sidebar's download button picks it up
     # on the next rerun (sidebar already rendered before the bulk job ran).
     from datetime import datetime
     st.session_state["bulk_pdf"] = pdf_bytes
-    st.session_state["bulk_pdf_count"] = len(banks)
+    st.session_state["bulk_pdf_count"] = n_whitelisted
     st.session_state["bulk_pdf_when"] = datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
     st.session_state["bulk_pdf_run"] = False
 
     bulk_progress.empty()
-    bulk_status.success(f"✅ PDF generated — {len(banks)} banks screened.")
+    bulk_status.success(
+        f"✅ PDF generated — {n_whitelisted} whitelisted banks "
+        f"(out of {len(banks)} screened)."
+    )
 
     # Render the download button INLINE in the main panel. The sidebar is
     # already rendered at this point so it'd take a rerun to update there,
@@ -1866,7 +2009,7 @@ if st.session_state.get("bulk_pdf_run") and not st.session_state.get("bulk_pdf")
     st.download_button(
         "⬇️ Download PDF",
         data=pdf_bytes,
-        file_name=f"russian_banks_screening_{datetime.utcnow().strftime('%Y%m%d_%H%M')}.pdf",
+        file_name=f"russian_banks_whitelisted_{datetime.utcnow().strftime('%Y%m%d_%H%M')}.pdf",
         mime="application/pdf",
         type="primary",
     )
